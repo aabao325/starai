@@ -1,6 +1,7 @@
 "use client";
 
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { readEventStream } from "@/lib/eventStream";
 import Link from "next/link";
 import { ArrowUp, AudioLines, BrainCircuit, ChevronDown, ChevronRight, Download, Globe, HelpCircle, History, ImageIcon, Loader2, Maximize2, Menu, Music2, Plus, RotateCcw, SlidersHorizontal, Sparkles, Upload, UserRound, Video, X } from "lucide-react";
 import type { Model, User } from "@starai/shared-types";
@@ -59,32 +60,16 @@ async function streamAgentPlan(payload: Record<string, unknown>, onEvent: (event
     return body.data as AgentPlanResponse;
   }
 
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("当前浏览器不支持流式输出");
-  const decoder = new TextDecoder();
-  let buffer = "";
+  if (!response.body) throw new Error("当前浏览器不支持流式输出");
   let meta: AgentPlanResponse = {};
   let result: AgentPlanResponse = {};
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    const blocks = buffer.split(/\r?\n\r?\n/);
-    buffer = blocks.pop() || "";
-    for (const block of blocks) {
-      let event = "message";
-      const dataLines: string[] = [];
-      for (const line of block.split(/\r?\n/)) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
-      }
-      if (!dataLines.length) continue;
-      const data = JSON.parse(dataLines.join("\n")) as AgentPlanResponse & { content?: string; message?: string };
-      if (event === "meta") meta = { ...meta, ...data };
-      if (event === "done") result = { ...meta, ...data };
-      if (event === "error") throw new Error(data.message || "智能体生成失败");
-      onEvent(event, data);
-    }
-    if (done) break;
+  for await (const { event, data: raw } of readEventStream(response.body)) {
+    if (raw === "[DONE]") continue;
+    const data = JSON.parse(raw) as AgentPlanResponse & { content?: string; message?: string };
+    if (event === "meta") meta = { ...meta, ...data };
+    if (event === "done") result = { ...meta, ...data };
+    if (event === "error") throw new Error(data.message || "智能体生成失败");
+    onEvent(event, data);
   }
   return result;
 }

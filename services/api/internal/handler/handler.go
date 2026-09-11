@@ -1800,6 +1800,7 @@ func (h *Handler) chatStreamSingle(c *gin.Context, userID int64, input service.C
 
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.WriteHeader(http.StatusOK)
 	flusher, _ := c.Writer.(http.Flusher)
@@ -1840,13 +1841,16 @@ func (h *Handler) chatStreamSingle(c *gin.Context, userID int64, input service.C
 			break
 		}
 	}
-	_, finalizeErr := h.chat.FinalizeStream(context.Background(), userID, requestID, input, fullContent, fullReasoningContent, usage, estimated)
+	conversationID, finalizeErr := h.chat.FinalizeStream(context.Background(), userID, requestID, input, fullContent, fullReasoningContent, usage, estimated)
 	if finalizeErr != nil {
 		openAIStreamError(c, "费用结算失败，请联系客服核对账单")
 		flusher.Flush()
 		return
 	}
-	writeOpenAIStreamChunk(c, requestID, input.ModelCode, map[string]interface{}{}, "stop", usage)
+	final := buildOpenAIStreamPayload(requestID, input.ModelCode, map[string]interface{}{}, "stop", usage)
+	final["conversation_id"] = conversationID
+	data, _ := json.Marshal(final)
+	c.Writer.Write([]byte("data: " + string(data) + "\n\n"))
 	c.Writer.Write([]byte("data: [DONE]\n\n"))
 	flusher.Flush()
 }
@@ -1967,6 +1971,7 @@ func (h *Handler) chatMultiStream(c *gin.Context, userID int64, input service.Co
 
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.WriteHeader(http.StatusOK)
 	flusher, _ := c.Writer.(http.Flusher)

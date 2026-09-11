@@ -1,5 +1,6 @@
 ﻿"use client";
 
+import { readEventStream } from "@/lib/eventStream";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -1482,11 +1483,9 @@ export function ModelWorkspace({ model, initialPrompt, onOpenModelPicker, onOpen
         throw new Error(json.error?.message || json.message || UI_TEXT.requestFailed);
                                                                                                                                                                                                                                                                                                                       }
 
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
+      const body = res.body;
       setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
-      let buffer = "";
       const applyDelta = (content: string, reasoning = "") => {
         receivedReply = true;
         assistantContent += content;
@@ -1518,128 +1517,106 @@ export function ModelWorkspace({ model, initialPrompt, onOpenModelPicker, onOpen
         });
       };
 
-      if (!reader) {
-        throw new Error("模型服务没有返回可读取的响应流，请稍后重试。");
-      }
-
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          // Reverse proxies may normalize SSE boundaries to CRLF. Normalize
-          // them before splitting so a valid upstream answer never remains in
-          // the incomplete buffer and appears only after reopening history.
-          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-          const events = buffer.split("\n\n");
-          buffer = events.pop() || "";
-          for (const evt of events) {
-            let eventType = "";
-            let dataStr = "";
-            for (const line of evt.split("\n")) {
-              if (line.startsWith("event: ")) eventType = line.slice(7).trim();
-              else if (line.startsWith("data: ")) dataStr += line.slice(6);
+      if (!body) throw new Error("模型服务没有返回可读取的响应流，请稍后重试。");
+      for await (const { event: eventType, data: dataStr } of readEventStream(body)) {
+        if (!dataStr) continue;
+        if (dataStr === "[DONE]") continue;
+        let data: Record<string, unknown> = {};
+        try {
+          data = JSON.parse(dataStr);
+        } catch {
+          continue;
+        }
+        if (typeof data.conversation_id === "string" && data.conversation_id) setConversationId(data.conversation_id);
+        const streamError = data.error;
+        if (streamError && typeof streamError === "object") {
+          const error = streamError as { message?: unknown };
+          throw new Error(typeof error.message === "string" ? error.message : "模型服务返回了错误。");
+        }
+        if (eventType === "mm_start") {
+          receivedMultiModelEvent = true;
+          setMmMode(true);
+          setMmActiveTab("answer");
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && !last.content.trim()) {
+              return prev.slice(0, -1);
             }
-            if (!dataStr) continue;
-            if (dataStr === "[DONE]") continue;
-            let data: Record<string, unknown> = {};
-            try {
-              data = JSON.parse(dataStr);
-            } catch {
-              continue;
-            }
-            const streamError = data.error;
-            if (streamError && typeof streamError === "object") {
-              const error = streamError as { message?: unknown };
-              throw new Error(typeof error.message === "string" ? error.message : "模型服务返回了错误。");
-            }
-            if (eventType === "mm_start") {
-              receivedMultiModelEvent = true;
-              setMmMode(true);
-              setMmActiveTab("answer");
-              setMessages((prev) => {
-                const last = prev[prev.length - 1];
-                if (last?.role === "assistant" && !last.content.trim()) {
-                  return prev.slice(0, -1);
-                }
-                return prev;
-              });
-            } else if (eventType === "mm_model_start") {
-              receivedMultiModelEvent = true;
-              setMmMode(true);
-              const code = String(data.model_code || "");
-              if (code) {
-                upsertMmResult({
-                  model_code: code,
-                  display_name: typeof data.display_name === "string" ? data.display_name : code,
-                  icon_url: typeof data.icon_url === "string" ? data.icon_url : undefined,
-                });
-              }
-            } else if (eventType === "mm_model_delta") {
-              receivedMultiModelEvent = true;
-              setMmMode(true);
-              const code = String(data.model_code || "");
-              const content = typeof data.content === "string" ? data.content : "";
-              if (code && content) {
-                setMmResults((prev) => {
-                  const idx = prev.findIndex((r) => r.model_code === code);
-                  if (idx === -1) return [...prev, { model_code: code, display_name: code, content, icon_url: undefined }];
-                  const next = [...prev];
-                  next[idx] = { ...next[idx], content: (next[idx].content || "") + content };
-                  return next;
-                });
-              }
-            } else if (eventType === "mm_model_done") {
-              receivedMultiModelEvent = true;
-              setMmMode(true);
-              const code = String(data.model_code || "");
-              if (code && typeof data.error === "object" && data.error) {
-                const errObj = data.error as { code?: string; message?: string };
-                upsertMmResult({
-                  model_code: code,
-                  error: { code: errObj.code || "MODEL_PROVIDER_ERROR", message: errObj.message || "Model error" },
-                });
-              }
-            } else if (eventType === "mm_done") {
-              receivedMultiModelEvent = true;
-              setMmMode(true);
-              if (typeof data.conversation_id === "string" && data.conversation_id) {
-                setConversationId(data.conversation_id);
-              }
-              if (typeof data.summary === "string") setMmSummary(data.summary);
-              if (Array.isArray(data.results)) {
-                const items = data.results as any[];
-                setMmResults(
-                  items
-                    .filter((x) => x && typeof x.model_code === "string")
-                    .map((x) => ({
-                      model_code: String(x.model_code),
-                      display_name: String(x.display_name || x.model_code),
-                      icon_url: typeof x.icon_url === "string" ? x.icon_url : undefined,
-                      content: typeof x.content === "string" ? x.content : "",
-                      error: x.error && typeof x.error === "object" ? { code: String(x.error.code || ""), message: String(x.error.message || "") } : undefined,
-                    }))
-                );
-              }
-            } else if (eventType === "delta" && typeof data.content === "string") {
-              applyDelta(data.content);
-            } else if (eventType === "done") {
-              if (typeof data.conversation_id === "string" && data.conversation_id) {
-                setConversationId(data.conversation_id);
-              }
-            } else if (eventType === "error" || eventType === "mm_error") {
-              throw new Error((data.message as string) || "Model error");
-            } else if (!eventType && typeof data.content === "string") {
-              applyDelta(data.content);
-            } else if (!eventType && Array.isArray(data.choices)) {
-              const choice = data.choices[0] as { delta?: { content?: unknown; reasoning_content?: unknown; tool_calls?: unknown[] } } | undefined;
-              const content = typeof choice?.delta?.content === "string" ? choice.delta.content : "";
-              const reasoning = typeof choice?.delta?.reasoning_content === "string" ? choice.delta.reasoning_content : "";
-              if (content || reasoning) {
-                applyDelta(content, reasoning);
-              } else if (Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0) {
-                receivedReply = true;
-              }
-            }
+            return prev;
+          });
+        } else if (eventType === "mm_model_start") {
+          receivedMultiModelEvent = true;
+          setMmMode(true);
+          const code = String(data.model_code || "");
+          if (code) {
+            upsertMmResult({
+              model_code: code,
+              display_name: typeof data.display_name === "string" ? data.display_name : code,
+              icon_url: typeof data.icon_url === "string" ? data.icon_url : undefined,
+            });
+          }
+        } else if (eventType === "mm_model_delta") {
+          receivedMultiModelEvent = true;
+          setMmMode(true);
+          const code = String(data.model_code || "");
+          const content = typeof data.content === "string" ? data.content : "";
+          if (code && content) {
+            setMmResults((prev) => {
+              const idx = prev.findIndex((r) => r.model_code === code);
+              if (idx === -1) return [...prev, { model_code: code, display_name: code, content, icon_url: undefined }];
+              const next = [...prev];
+              next[idx] = { ...next[idx], content: (next[idx].content || "") + content };
+              return next;
+            });
+          }
+        } else if (eventType === "mm_model_done") {
+          receivedMultiModelEvent = true;
+          setMmMode(true);
+          const code = String(data.model_code || "");
+          if (code && typeof data.error === "object" && data.error) {
+            const errObj = data.error as { code?: string; message?: string };
+            upsertMmResult({
+              model_code: code,
+              error: { code: errObj.code || "MODEL_PROVIDER_ERROR", message: errObj.message || "Model error" },
+            });
+          }
+        } else if (eventType === "mm_done") {
+          receivedMultiModelEvent = true;
+          setMmMode(true);
+          if (typeof data.conversation_id === "string" && data.conversation_id) {
+            setConversationId(data.conversation_id);
+          }
+          if (typeof data.summary === "string") setMmSummary(data.summary);
+          if (Array.isArray(data.results)) {
+            const items = data.results as any[];
+            setMmResults(
+              items
+                .filter((x) => x && typeof x.model_code === "string")
+                .map((x) => ({
+                  model_code: String(x.model_code),
+                  display_name: String(x.display_name || x.model_code),
+                  icon_url: typeof x.icon_url === "string" ? x.icon_url : undefined,
+                  content: typeof x.content === "string" ? x.content : "",
+                  error: x.error && typeof x.error === "object" ? { code: String(x.error.code || ""), message: String(x.error.message || "") } : undefined,
+                }))
+            );
+          }
+        } else if (eventType === "delta" && typeof data.content === "string") {
+          applyDelta(data.content);
+        } else if (eventType === "done") {
+          if (typeof data.conversation_id === "string" && data.conversation_id) {
+            setConversationId(data.conversation_id);
+          }
+        } else if (eventType === "error" || eventType === "mm_error") {
+          throw new Error((data.message as string) || "Model error");
+        } else if ((!eventType || eventType === "message") && typeof data.content === "string") {
+          applyDelta(data.content);
+        } else if ((!eventType || eventType === "message") && Array.isArray(data.choices)) {
+          const choice = data.choices[0] as { delta?: { content?: unknown; reasoning_content?: unknown; tool_calls?: unknown[] } } | undefined;
+          const content = typeof choice?.delta?.content === "string" ? choice.delta.content : "";
+          const reasoning = typeof choice?.delta?.reasoning_content === "string" ? choice.delta.reasoning_content : "";
+          if (content || reasoning) {
+            applyDelta(content, reasoning);
           }
         }
       }
