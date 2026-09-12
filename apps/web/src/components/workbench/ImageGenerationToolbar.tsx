@@ -88,6 +88,7 @@ export function ImageGenerationToolbar({
   ratios = ALL_RATIOS,
   sizeTiers = IMAGE_SIZE_TIERS,
   showSizeTier = true,
+  showCount = true,
 }: {
   count: number;
   onCountChange: (value: number) => void;
@@ -102,6 +103,7 @@ export function ImageGenerationToolbar({
   ratios?: ImageAspectRatio[];
   sizeTiers?: ImageSizeTier[];
   showSizeTier?: boolean;
+  showCount?: boolean;
 }) {
   const { t, ts } = useI18n();
   const [customDraft, setCustomDraft] = useState(String(count || 1));
@@ -114,7 +116,7 @@ export function ImageGenerationToolbar({
 
   return (
     <>
-      <MediaOptionMenu
+      {showCount && <MediaOptionMenu
         icon={<Grid3X3 size={16} />}
         activeLabel={`${count || 1} ${imageUnit}`}
         title={t("imageToolbar.count")}
@@ -164,7 +166,7 @@ export function ImageGenerationToolbar({
             </div>
           </div>
         )}
-      </MediaOptionMenu>
+      </MediaOptionMenu>}
 
       {onExactSizeChange ? (
         <MediaOptionMenu

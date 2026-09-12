@@ -89,8 +89,21 @@ type Workflow = {
 };
 type NodeRun = { node_id: string; name: string; type: string; status: string; output: Record<string, any>; error?: string };
 type DetailSection = { id?: string; type?: string; title?: string; objective?: string; copy_title?: string; copy_points?: string[]; image_url?: string; status?: string };
-type DetailPageOutput = { status?: string; compose_status?: string; compose_error?: string; long_image_url?: string; section_count?: number; completed_count?: number; sections?: DetailSection[] };
+type DetailPageOutput = { render_mode?: string; status?: string; compose_status?: string; compose_error?: string; long_image_url?: string; section_count?: number; completed_count?: number; sections?: DetailSection[] };
 type MediaTask = { task_no: string; type?: "image" | "video" | "audio"; status: string; progress: number; output?: Record<string, any>; error_message?: string; detail_section?: DetailSection };
+
+function resolvedAgentMediaTasks(project: Project | null): MediaTask[] {
+  const stored = (project?.outputs?.media_tasks || []) as MediaTask[];
+  const tasks = project?.media_tasks?.length ? project.media_tasks : stored;
+  if (project?.inputs?.creative_scene !== "detail_image") return tasks;
+  const prepared = new Map(stored.map(task => [task.task_no, task]));
+  return tasks.map(task => {
+    const result = prepared.get(task.task_no);
+    return task.status === "succeeded" && result?.status === "succeeded" && result.output?.source_image_url && result.output?.image_url
+      ? { ...task, output: result.output }
+      : task;
+  });
+}
 type ReferenceImage = { url: string; name: string; public_id?: string };
 type AnalysisCandidate = { id: string; title?: string; reason?: string; prompt: string; negative_prompt?: string; params?: Record<string, unknown> };
 type Project = {
@@ -307,7 +320,7 @@ function normalizeCreativeScenes(items: unknown, generationType: "image" | "vide
 function clientScenePrompt(code: string, label: string, generationType: "image" | "video") {
   const rules: Record<string, string> = {
     main_image: "必须生成电商商品主图：商品主体清晰，背景干净或高级简洁，突出材质和卖点，不要做成详情页、场景图或海报。",
-    detail_image: "必须生成商品详情图：突出商品结构、材质细节、功能卖点、规格层次和详情页排版感，不要生成普通主图。",
+    detail_image: "生成有阅读顺序的商品详情页，各模块围绕已确认信息分别展示首屏、设计、可见细节和使用情境；不重复拼图，没有依据时不强凑功能和规格。",
     scene_image: "必须生成电商场景图：把商品放入真实使用场景，保留商品主体一致性，强调生活方式、光影和购买欲。",
     marketing_poster: "必须生成营销海报：强调广告构图、活动氛围、传播冲击力、品牌质感和标题留白，不要生成普通商品主图。",
     product_video: "必须生成商品展示短视频：围绕商品主体做展示、运镜、卖点节奏和商业光影，不要生成无关风景或普通素材。",
@@ -329,7 +342,9 @@ export function AgentWorkspace({ code }: { code: string }) {
   const [comicImageModels, setComicImageModels] = useState<Model[]>([]);
   const [comicVideoModels, setComicVideoModels] = useState<Model[]>([]);
   const [prompt, setPrompt] = useState("");
+  const [commerceBrief, setCommerceBrief] = useState({ channel: "", audience: "", visual: "" });
   const [count, setCount] = useState(1);
+  const [detailSectionCount, setDetailSectionCount] = useState(5);
   const [imageRatio, setImageRatio] = useState("1:1");
   const [imageSize, setImageSize] = useState("1K");
   const { languages: generationLanguages, selectedCode: languageCode, setSelectedCode: setLanguageCode, selectedLanguage } = useGenerationLanguages();
@@ -529,10 +544,7 @@ export function AgentWorkspace({ code }: { code: string }) {
     () => project?.outputs?.analysis || project?.node_runs?.find((n) => n.node_id === "analysis")?.output || {},
     [project]
   );
-  const allMediaTasks = useMemo(
-    () => (project?.media_tasks?.length ? project.media_tasks : ((project?.outputs?.media_tasks || []) as MediaTask[])),
-    [project]
-  );
+  const allMediaTasks = useMemo(() => resolvedAgentMediaTasks(project), [project]);
   const finalVideoURL = textOf(project?.outputs?.final_video_url);
   const detailPage = (project?.outputs?.detail_page || null) as DetailPageOutput | null;
   const mediaTasks = useMemo(
@@ -702,10 +714,6 @@ export function AgentWorkspace({ code }: { code: string }) {
     }
   }, [generationType, outputScenes, selectedScene]);
 
-  useEffect(() => {
-    if (isDetailPageScene && count < 4) setCount(6);
-  }, [count, isDetailPageScene]);
-
   const startPolling = (publicId: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
@@ -745,7 +753,7 @@ export function AgentWorkspace({ code }: { code: string }) {
         ? buildVideoTaskParams(params, videoMedia, generationModel.runtime_rule)
         : {};
       const imageParams = !isVideoGeneration
-        ? buildImageGenerationParams({ count, ratio: imageRatio, imageSize })
+        ? buildImageGenerationParams({ count: isDetailPageScene ? detailSectionCount : count, ratio: imageRatio, imageSize })
         : {};
       const languageParams = buildLanguageParams(selectedLanguage);
       const imageURL =
@@ -762,7 +770,7 @@ export function AgentWorkspace({ code }: { code: string }) {
         ...videoMedia.reference_images.map((x) => x.public_id),
       ].filter((x): x is string => !!x);
       const scenePrompt = clientScenePrompt(selectedSceneMeta.code, selectedSceneMeta.label, generationType);
-      const userPrompt = prompt.trim();
+      const userPrompt = [prompt.trim(), code === "ecommerce_image" ? [commerceBrief.channel && `发布渠道：${commerceBrief.channel}`, commerceBrief.audience && `目标受众：${commerceBrief.audience}`, commerceBrief.visual && `视觉风格：${commerceBrief.visual}`].filter(Boolean).join("\n") : ""].filter(Boolean).join("\n\n");
       const p = await api<Project>(`/api/agents/${code}/projects`, {
         method: "POST",
         body: JSON.stringify({
@@ -777,7 +785,7 @@ export function AgentWorkspace({ code }: { code: string }) {
             scene_prompt: scenePrompt,
             creative_scene: selectedSceneMeta.code,
             creative_scene_label: selectedSceneMeta.label,
-            detail_section_count: isDetailPageScene ? Math.max(4, Math.min(8, count || 6)) : undefined,
+            detail_section_count: isDetailPageScene ? detailSectionCount : undefined,
             generation_language: languageParams.language,
             generation_language_label: languageParams.language_label,
             ...(isComicDrama ? {
@@ -794,7 +802,7 @@ export function AgentWorkspace({ code }: { code: string }) {
             count: Number((videoParams as any).count ?? (imageParams as any).count ?? params.count ?? count),
             n: Number((videoParams as any).count ?? (imageParams as any).n ?? params.count ?? count),
             image_url: imageURL || undefined,
-            ...(!isVideoGeneration && imageURL ? { reference_images: [imageURL] } : {}),
+            ...(!isVideoGeneration && imageURL ? { reference_images: code === "ecommerce_image" ? comicReferenceURLs : [imageURL] } : {}),
             reference_asset_ids: referenceAssetIds,
             _mode: !enableStepConfirm || mode === "auto" ? "auto" : "step",
           },
@@ -930,20 +938,26 @@ export function AgentWorkspace({ code }: { code: string }) {
 
   const retry = async () => {
     if (!project) return;
-		const failedNode = [...(project.node_runs || [])].reverse().find((node) => node.status === "failed");
-		if (failedNode) {
-			await api(`/api/agent-projects/${project.public_id}/retry-node`, {
-				method: "POST",
-				body: JSON.stringify({
-					node_id: failedNode.node_id,
-					image_model_code: comicSettings.image_model_code,
-					video_model_code: comicSettings.video_model_code,
-				}),
-			});
-		} else {
-			await api(`/api/agent-projects/${project.public_id}/retry`, { method: "POST" });
-		}
-    startPolling(project.public_id);
+    setError("");
+    try {
+      const failedNode = [...(project.node_runs || [])].reverse().find((node) => node.status === "failed");
+      const canRetryNode = failedNode && ["comic_plan", "keyframes", "video_segments", "narrations", "compose", "generate"].includes(failedNode.node_id);
+      if (canRetryNode) {
+        await api(`/api/agent-projects/${project.public_id}/retry-node`, {
+          method: "POST",
+          body: JSON.stringify({
+            node_id: failedNode.node_id,
+            image_model_code: comicSettings.image_model_code,
+            video_model_code: comicSettings.video_model_code,
+          }),
+        });
+      } else {
+        await api(`/api/agent-projects/${project.public_id}/retry`, { method: "POST" });
+      }
+      startPolling(project.public_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重试失败");
+    }
   };
 
   const cancelProject = async () => {
@@ -1707,7 +1721,7 @@ export function AgentWorkspace({ code }: { code: string }) {
           <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_70%_10%,rgba(34,211,238,.22),transparent_28%),radial-gradient(circle_at_12%_84%,rgba(20,184,166,.16),transparent_22%)] dark:bg-[radial-gradient(circle_at_76%_10%,rgba(20,184,166,.2),transparent_28%),radial-gradient(circle_at_14%_82%,rgba(6,182,212,.12),transparent_22%)]" />
         </>
       )}
-      <div className="relative z-10 shrink-0 px-4 sm:px-6 py-3 flex items-center justify-between">
+      <div className="relative z-20 shrink-0 px-4 sm:px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <button onClick={resetTask} className="h-9 px-3 rounded-xl bg-primary text-dark text-sm font-semibold flex items-center gap-1.5"><Plus size={15} />{t("common.newTask")}</button>
           <div className="relative">
@@ -1768,6 +1782,7 @@ export function AgentWorkspace({ code }: { code: string }) {
                   </div>
                   <div className="h-2 rounded-full bg-gray-100 dark:bg-white/10 overflow-hidden"><div className="h-full bg-primary transition-all" style={{ width: totalProgress + "%" }} /></div>
                   {isComicDrama && <ComicProjectPanel project={project} />}
+                  {code === "ecommerce_image" && Array.isArray(analysis.missing_information) && analysis.missing_information.length > 0 && <div className="rounded-xl bg-amber-500/10 p-3 text-xs leading-6 text-amber-800 dark:text-amber-200"><p className="font-semibold">{ts("尚未确认的信息（不会作为商品事实使用）")}</p>{analysis.missing_information.map((item: unknown, i: number) => <p key={i}>{textOf(item)}</p>)}</div>}
 
                   {project.status === "waiting_confirm" && (
                     <div className="rounded-2xl border border-amber-100 bg-amber-50 p-4 space-y-3 dark:bg-amber-500/10 dark:border-amber-400/20">
@@ -1809,6 +1824,12 @@ export function AgentWorkspace({ code }: { code: string }) {
                         onChange={(e) => setConfirmPrompt(e.target.value)}
                         className="w-full h-32 rounded-xl border border-amber-100 bg-white px-3 py-2 text-sm focus:outline-none read-only:bg-gray-50 read-only:text-gray-500 dark:bg-gray-950 dark:border-amber-400/20 dark:text-gray-100 dark:read-only:bg-white/5 dark:read-only:text-gray-400"
                       />
+                      {Array.isArray(analysis.detail_sections) && analysis.detail_sections.length > 0 && (
+                        <details className="text-sm" open>
+                          <summary className="cursor-pointer py-2 font-medium">{ts("详情模块与成图文案")}</summary>
+                          <DetailPagePanel detailPage={{ status: "planning", sections: analysis.detail_sections as DetailSection[] }} />
+                        </details>
+                      )}
                       <div className="flex items-center gap-2">
                         <button onClick={confirmStep} className="h-10 px-4 rounded-xl bg-primary text-dark font-semibold text-sm flex items-center gap-1.5"><Check size={16} />{t("agent.confirmGenerate")}</button>
                         {canUseAutopilot && <button onClick={enableAutopilot} className="h-10 px-4 rounded-xl bg-gray-900 text-white font-semibold text-sm flex items-center gap-1.5"><Wand2 size={16} />{t("agent.autopilot")}</button>}
@@ -1845,15 +1866,17 @@ export function AgentWorkspace({ code }: { code: string }) {
                     showUpload={false}
                     showRole={false}
                     referencePickMode
-                    referenceImages={isVideoGeneration ? videoMedia.reference_images : productImage ? [productImage] : []}
+                    referenceImages={isVideoGeneration ? videoMedia.reference_images : code === "ecommerce_image" ? currentComicReferences() : productImage ? [productImage] : []}
                     onReferenceImagesChange={(imgs) => {
                       if (isVideoGeneration) {
                         setVideoMedia((prev) => ({ ...prev, reference_images: imgs }));
+                      } else if (code === "ecommerce_image") {
+                        setComicReferences(imgs);
                       } else {
                         setProductImage(imgs[0] || null);
                       }
                     }}
-                    maxReferenceImages={supportMultipleReferences ? (isVideoGeneration ? maxVideoAssetRefs : 6) : 1}
+                    maxReferenceImages={code === "ecommerce_image" ? 8 : supportMultipleReferences ? (isVideoGeneration ? maxVideoAssetRefs : 6) : 1}
                   />
                   {(enableStepConfirm || canUseAutopilot) && (
                     <div className="flex items-center bg-gray-100 rounded-xl p-0.5 dark:bg-white/10">
@@ -1893,7 +1916,13 @@ export function AgentWorkspace({ code }: { code: string }) {
               </div>
             </div>
             <div className="px-3 sm:px-4 pt-3">
-              {supportReferenceImage && isVideoGeneration && generationModel ? (
+              {code === "ecommerce_image" && supportReferenceImage ? (
+                <div className="flex items-center gap-2 overflow-x-auto pb-1">
+                  {currentComicReferences().map((item,index) => <div key={item.url} className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl border border-gray-200 dark:border-white/10"><Image src={item.url} alt={item.name || `商品参考 ${index+1}`} width={128} height={128} className="h-full w-full object-cover" /><span className="absolute bottom-0 inset-x-0 bg-black/60 text-center text-[9px] text-white">{index === 0 ? ts("主体参考") : `${ts("补充参考")} ${index}`}</span><button type="button" aria-label={`${ts("移除参考图")} ${index+1}`} onClick={() => setComicReferences(currentComicReferences().filter(x => x.url !== item.url))} className="absolute right-0 top-0 rounded-bl bg-black/70 p-0.5 text-white"><X size={12}/></button></div>)}
+                  {currentComicReferences().length < 8 && <label className="flex h-16 w-20 shrink-0 cursor-pointer flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-gray-300 text-gray-500 dark:border-white/20 dark:text-gray-400">{uploading ? <Loader2 size={18} className="animate-spin"/> : <Plus size={18}/>}<span className="text-[10px]">{ts("参考图")} {currentComicReferences().length}/8</span><input type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" className="hidden" disabled={uploading} onChange={e => {void handleComicUploads(e.target.files);e.target.value="";}}/></label>}
+                  <span className="max-w-52 shrink-0 text-[11px] leading-5 text-gray-400">{ts("首图为商品主体，可补充背面、细节、包装；不同款式请分开生成。")}</span>
+                </div>
+              ) : supportReferenceImage && isVideoGeneration && generationModel ? (
                 <VideoUploadArea config={videoConfig} media={videoMedia} onChange={setVideoMedia} />
               ) : supportReferenceImage ? (
                 <div className="scroll-x-only flex flex-nowrap items-center gap-2 h-16 min-w-0">
@@ -1918,9 +1947,16 @@ export function AgentWorkspace({ code }: { code: string }) {
                 </div>
               ) : null}
             </div>
-            <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder={workflow ? td(`agent.${workflow.code}.input.placeholder`, display.input?.placeholder || t("agent.inputPlaceholder")) : (display.input?.placeholder || t("agent.inputPlaceholder"))} rows={3} className="w-full min-h-[88px] resize-none bg-transparent px-4 py-3 text-sm text-gray-700 focus:outline-none placeholder:text-gray-400 leading-relaxed dark:text-gray-100 dark:placeholder:text-gray-500" />
+            <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder={code === "ecommerce_image" ? ts("描述商品、真实卖点和出图需求；可补充尺寸、材质、品牌色及需要保留的细节。") : workflow ? td(`agent.${workflow.code}.input.placeholder`, display.input?.placeholder || t("agent.inputPlaceholder")) : (display.input?.placeholder || t("agent.inputPlaceholder"))} rows={3} className="w-full min-h-[88px] resize-none bg-transparent px-4 py-3 text-sm text-gray-700 focus:outline-none placeholder:text-gray-400 leading-relaxed dark:text-gray-100 dark:placeholder:text-gray-500" />
             <div className="px-3 sm:px-4 py-3 border-t border-gray-50 dark:border-white/10 flex items-center gap-2">
               <div className="scroll-x-only flex min-w-0 flex-1 flex-nowrap items-center gap-2 overflow-x-auto pb-1">
+                {code === "ecommerce_image" && ([
+                  {key:"channel", label:"渠道", options:["淘宝 / 天猫","京东","拼多多","抖音电商","小红书","亚马逊","Shopify / 独立站"]},
+                  {key:"audience", label:"受众", options:["大众日常","学生青年","都市通勤","家庭生活","亲子家庭","户外运动","品质消费","礼赠人群"]},
+                  {key:"visual", label:"视觉", options:["简约白底","自然生活","高级质感","清新柔和","科技未来","国风雅致","复古胶片","活力撞色"]},
+                ] as const).map(setting => <MediaOptionMenu key={setting.key} icon={<Settings2 size={14}/>} title={ts(setting.label)} subtitle={ts("选择常用选项，其他要求可写在输入框中")} activeLabel={commerceBrief[setting.key] || ts(setting.label + " · 自动")} compactOnMobile>
+                  {close => <div className="space-y-1"><MediaMenuOption selected={!commerceBrief[setting.key]} onClick={() => {setCommerceBrief(v => ({...v,[setting.key]:""}));close();}}>{ts("自动 · 按输入内容")}</MediaMenuOption>{setting.options.map(option => <MediaMenuOption key={option} selected={commerceBrief[setting.key] === option} onClick={() => {setCommerceBrief(v => ({...v,[setting.key]:option}));close();}}>{ts(option)}</MediaMenuOption>)}<p className="px-2 pt-2 text-[11px] text-gray-400">{ts("其他要求可直接写在输入框中")}</p></div>}
+                </MediaOptionMenu>)}
                 {isComicDrama ? (
                   <ComicSettingsSummary settings={comicSettings} onOpen={() => setSettingsOpen(true)} />
                 ) : (
@@ -1933,9 +1969,13 @@ export function AgentWorkspace({ code }: { code: string }) {
                   </>
                 ) : (
                   <>
+                    {isDetailPageScene && <MediaOptionMenu icon={<Settings2 size={14}/>} title={ts("详情页模块数")} activeLabel={`${detailSectionCount} ${ts("个模块")}`} subtitle={ts("默认5个：首屏、购买理由、细节、场景、收尾")} compactOnMobile>
+                      {close => <div className="space-y-1">{[4,5,6,7,8].map(n => <MediaMenuOption key={n} selected={detailSectionCount === n} onClick={() => {setDetailSectionCount(n);close();}}>{n} {ts("个模块")}{n === 5 ? ` · ${ts("推荐")}` : ""}</MediaMenuOption>)}<p className="px-2 pt-2 text-[11px] leading-5 text-gray-400">{ts("生成前先确认五个模块；规格、多色与包装仅在参考资料明确提供时使用。每个模块自动排版短文案并拼成长图。")}</p></div>}
+                    </MediaOptionMenu>}
                     <ImageGenerationToolbar
                       count={count}
-                      onCountChange={(value) => setCount(isDetailPageScene ? Math.max(4, Math.min(8, value)) : value)}
+                      showCount={!isDetailPageScene}
+                      onCountChange={setCount}
                       ratio={imageRatio}
                       onRatioChange={setImageRatio}
                       imageSize={imageSize}
@@ -2773,7 +2813,7 @@ function FinalComicVideo({ url }: { url: string }) {
 }
 
 function DetailPagePanel({ detailPage }: { detailPage: DetailPageOutput }) {
-  const { t } = useI18n();
+  const { t, ts } = useI18n();
   const sections = Array.isArray(detailPage.sections) ? detailPage.sections : [];
   const longURL = textOf(detailPage.long_image_url);
   return (
@@ -2782,11 +2822,11 @@ function DetailPagePanel({ detailPage }: { detailPage: DetailPageOutput }) {
         <div>
           <div className="text-sm font-semibold text-gray-900 dark:text-white">{t("agent.detailPage.title")}</div>
           <div className="mt-0.5 text-xs text-gray-500 dark:text-gray-300">
-            {t("agent.detailPage.completed")} {Number(detailPage.completed_count || sections.length)}/{Number(detailPage.section_count || sections.length)} {t("agent.detailPage.modules")}
+            {detailPage.status === "planning" ? `${sections.length} ${t("agent.detailPage.modules")}` : <>{t("agent.detailPage.completed")} {Number(detailPage.completed_count ?? sections.length)}/{Number(detailPage.section_count ?? sections.length)} {t("agent.detailPage.modules")}</>}
           </div>
         </div>
         <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold text-amber-700 dark:text-amber-200">
-          {detailPage.compose_status === "succeeded" ? t("agent.detailPage.longReady") : t("agent.detailPage.modulesReady")}
+          {detailPage.status === "planning" ? ts("待确认 · 按模块生成") : detailPage.status === "partial" ? ts("部分模块未完成") : detailPage.compose_status === "succeeded" ? (detailPage.render_mode === "typeset_modules" ? ts("详情长图已排版 · 请核对商品细节") : detailPage.render_mode === "designed_modules" ? ts("模型排版试稿 · 请核对文字") : ts("底图长图已就绪 · 待排版文案")) : t("agent.detailPage.modulesReady")}
         </span>
       </div>
       {longURL && (
@@ -2809,6 +2849,8 @@ function DetailPagePanel({ detailPage }: { detailPage: DetailPageOutput }) {
                 <span className="truncate text-xs font-semibold text-gray-800 dark:text-gray-100">{textOf(section.title || section.copy_title || `详情模块 ${index + 1}`)}</span>
               </div>
               {section.objective && <p className="mt-1 line-clamp-2 text-xs leading-5 text-gray-500 dark:text-gray-300">{section.objective}</p>}
+              {section.copy_title && <p className="mt-2 text-sm font-medium">{section.copy_title}</p>}
+              {Array.isArray(section.copy_points) && section.copy_points.map((point, i) => <p key={i} className="mt-1 select-text text-xs leading-5 text-gray-600 dark:text-gray-300">{point}</p>)}
             </div>
           ))}
         </div>

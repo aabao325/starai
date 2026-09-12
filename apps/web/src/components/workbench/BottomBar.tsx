@@ -514,6 +514,8 @@ export function ChatTopTools({
   const uploadFileRef = useRef<HTMLInputElement | null>(null);
   const [assetTab, setAssetTab] = useState<"mine" | "gallery">("mine");
   const [pickedRefs, setPickedRefs] = useState<ReferenceImagePick[]>([]);
+  const referenceImagesRef = useRef(referenceImages);
+  referenceImagesRef.current = referenceImages;
   const [galleryItems, setGalleryItems] = useState<GalleryPickItem[]>([]);
   const [galleryQuery, setGalleryQuery] = useState("");
   const [deletingAssetId, setDeletingAssetId] = useState<string | null>(null);
@@ -539,11 +541,13 @@ export function ChatTopTools({
     if (referencePickMode) {
       setAssetTab("mine");
       setGalleryQuery("");
-      setPickedRefs(referenceImages);
+      // Snapshot when opening. Parent renders (e.g. the agent carousel) must
+      // not overwrite the user's unconfirmed selection inside this dialog.
+      setPickedRefs(referenceImagesRef.current);
       setAssetKind("image");
       setAssetType("all");
     }
-  }, [assetOpen, referencePickMode, referenceImages]);
+  }, [assetOpen, referencePickMode]);
 
   const loadAssets = useCallback(
     async (override?: { kind?: AssetKind | "all"; type?: AssetType | "all"; q?: string }) => {

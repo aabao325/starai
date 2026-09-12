@@ -22,26 +22,26 @@ func TestAgentDetailSectionsBuildsCompletePagePlan(t *testing.T) {
 		},
 	}
 	sections := agentDetailSections(analysis, map[string]interface{}{"count": float64(1)}, "基础商品方案")
-	if len(sections) != 6 {
-		t.Fatalf("sections=%d, want 6", len(sections))
+	if len(sections) != 5 {
+		t.Fatalf("sections=%d, want 5", len(sections))
 	}
 	if sections[0]["title"] != "定制首屏" {
 		t.Fatalf("first section=%#v", sections[0])
 	}
-	if sections[5]["type"] != "specification" {
-		t.Fatalf("last default section=%#v", sections[5])
+	if sections[4]["type"] != "closing" {
+		t.Fatalf("last default section=%#v", sections[4])
 	}
 }
 
-func TestDetailSectionPromptEnforcesConsistencyAndNoRenderedText(t *testing.T) {
+func TestDetailSectionPromptEnforcesSingleDesignedModule(t *testing.T) {
 	prompt := detailSectionGenerationPrompt(
 		"玻尿酸精华液，30ml，三重保湿",
-		map[string]interface{}{"type": "material", "title": "材质细节", "objective": "展示瓶身和滴管", "image_prompt": "微距商品摄影"},
+		map[string]interface{}{"type": "material", "title": "材质细节", "objective": "展示瓶身和滴管", "image_prompt": "微距商品摄影", "copy_title": "瓶身细节", "copy_points": []string{"30ml"}},
 		2,
 		6,
 		map[string]interface{}{"creative_scene": "detail_image", "creative_scene_label": "商品详情图"},
 	)
-	for _, expected := range []string{"DETAIL PAGE MODULE 3/6", "严格保持参考商品", "不绘制任何标题", "商品详情图"} {
+	for _, expected := range []string{"DETAIL PAGE MODULE 3/6", "视觉真值", "不绘制任何新增文字", "模块镜头硬约束", "2–3个有层级的局部近景", "不得创造新颜色", "包装盒", "数量=1", "商品详情图"} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("prompt missing %q: %s", expected, prompt)
 		}
@@ -87,7 +87,7 @@ func TestComposeDetailPageLongImage(t *testing.T) {
 
 	urls := []string{
 		testPNGDataURL(t, 120, 80, color.RGBA{R: 255, A: 255}),
-		testPNGDataURL(t, 120, 60, color.RGBA{G: 255, A: 255}),
+		testPNGDataURL(t, 60, 30, color.RGBA{G: 255, A: 255}),
 	}
 	got, err := composeDetailPageLongImage(context.Background(), "wfp_test", urls)
 	if err != nil {
@@ -109,7 +109,7 @@ func TestComposeDetailPageLongImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if img.Bounds().Dx() != 120 || img.Bounds().Dy() != 156 {
+	if img.Bounds().Dx() != 120 || img.Bounds().Dy() != 140 {
 		t.Fatalf("bounds=%v", img.Bounds())
 	}
 }
@@ -127,4 +127,45 @@ func testPNGDataURL(t *testing.T, width, height int, fill color.Color) string {
 		t.Fatal(err)
 	}
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(out.Bytes())
+}
+
+func TestDetailFallbackHasUniqueEvidenceBasedModules(t *testing.T) {
+	for count := 4; count <= 8; count++ {
+		sections := agentDetailSections(nil, map[string]interface{}{"detail_section_count": count}, "商品")
+		if len(sections) != count {
+			t.Fatalf("count %d: %#v", count, sections)
+		}
+		if count == 5 && sections[count-1]["type"] != "closing" {
+			t.Fatalf("default five should close on the product: %#v", sections)
+		}
+		seen := map[string]bool{}
+		for _, section := range sections {
+			kind := stringAny(section["type"])
+			if seen[kind] {
+				t.Fatalf("duplicate %s", kind)
+			}
+			seen[kind] = true
+		}
+	}
+}
+
+func TestCommerceAnalysisRequiresGroundedClaimsAndDetailCopy(t *testing.T) {
+	prompt := buildAgentAnalysisSystemPrompt("image", "ecommerce_image", 3, "detail_image")
+	for _, want := range []string{"missing_information", "不能改变商品事实", "detail_section_count", "文字分别交付", "2–3个局部近景", "不制作空参数表", "无依据时留空"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("missing %s", want)
+		}
+	}
+}
+
+func TestCommerceReferencesPreserveAllViews(t *testing.T) {
+	inputs := map[string]interface{}{"image_url": "https://example.com/front.jpg", "reference_images": []string{"https://example.com/front.jpg", "https://example.com/back.jpg", "https://example.com/detail.jpg"}}
+	refs := referenceImageURLs(inputs)
+	if len(refs) != 3 || refs[0] != "https://example.com/front.jpg" {
+		t.Fatalf("references: %#v", refs)
+	}
+	task := agentMediaTaskInput(inputs, "商品详情", "qa")
+	if len(referenceImageURLs(task)) != 3 {
+		t.Fatalf("task lost reference views: %#v", task)
+	}
 }

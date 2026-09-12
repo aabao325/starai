@@ -1089,7 +1089,7 @@ func executeWorkerGenerationAttempt(ctx context.Context, pool *pgxpool.Pool, p I
 }
 
 func applyOpenAIImageOptions(out, input map[string]interface{}) {
-	for _, key := range []string{"quality", "style", "background", "output_format", "moderation", "seed", "negative_prompt", "watermark"} {
+	for _, key := range []string{"quality", "style", "background", "output_format", "moderation", "input_fidelity", "seed", "negative_prompt", "watermark"} {
 		if value, ok := input[key]; ok && value != nil && strings.TrimSpace(fmt.Sprint(value)) != "" {
 			out[key] = value
 		}
@@ -1135,7 +1135,7 @@ func buildOpenAIImagesPayload(upstreamModel, modelCode, prompt string, count int
 		"size":    size,
 		"quality": normalizeOpenAIImageQuality(input["quality"]),
 	}
-	for _, key := range []string{"background", "output_format", "output_compression", "moderation", "user", "response_format"} {
+	for _, key := range []string{"background", "output_format", "output_compression", "moderation", "input_fidelity", "user", "response_format"} {
 		if value, ok := input[key]; ok && value != nil && strings.TrimSpace(fmt.Sprint(value)) != "" {
 			payload[key] = value
 		}

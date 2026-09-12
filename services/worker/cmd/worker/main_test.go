@@ -78,9 +78,9 @@ func TestResolveImageGenerationInputPreservesExplicitSize(t *testing.T) {
 func TestApplyOpenAIImageOptionsKeepsThirdPartyParameters(t *testing.T) {
 	out := map[string]interface{}{}
 	applyOpenAIImageOptions(out, map[string]interface{}{
-		"quality": "hd", "style": "natural", "negative_prompt": "blur", "wait": true,
+		"quality": "hd", "style": "natural", "input_fidelity": "high", "negative_prompt": "blur", "wait": true,
 	})
-	if out["quality"] != "hd" || out["style"] != "natural" || out["negative_prompt"] != "blur" {
+	if out["quality"] != "hd" || out["style"] != "natural" || out["input_fidelity"] != "high" || out["negative_prompt"] != "blur" {
 		t.Fatalf("third-party image options were lost: %#v", out)
 	}
 	if _, leaked := out["wait"]; leaked {
@@ -92,7 +92,7 @@ func TestBuildOpenAIImagesPayloadUsesStrictCompatibleFields(t *testing.T) {
 	payload := buildOpenAIImagesPayload("gpt-image-1", "fallback", "draw a cat", 2, map[string]interface{}{
 		"size": "1344x768", "quality": "1K", "aspect_ratio": "16:9", "image_size": "1K",
 		"negative_prompt": "blur", "watermark": true, "reference_images": []interface{}{"https://example.com/ref.png"},
-		"background": "transparent", "output_format": "png",
+		"background": "transparent", "output_format": "png", "input_fidelity": "high",
 	})
 	if payload["model"] != "gpt-image-1" || payload["prompt"] != "draw a cat" || payload["n"] != 2 {
 		t.Fatalf("required OpenAI Images fields are wrong: %#v", payload)
@@ -102,6 +102,9 @@ func TestBuildOpenAIImagesPayloadUsesStrictCompatibleFields(t *testing.T) {
 	}
 	if payload["background"] != "transparent" || payload["output_format"] != "png" {
 		t.Fatalf("supported OpenAI Images options were lost: %#v", payload)
+	}
+	if payload["input_fidelity"] != "high" {
+		t.Fatalf("input fidelity was lost: %#v", payload)
 	}
 	for _, key := range []string{"aspect_ratio", "image_size", "negative_prompt", "watermark", "reference_images", "image"} {
 		if _, leaked := payload[key]; leaked {
@@ -154,7 +157,7 @@ func TestOpenAIImagesReferenceUploadUsesEditsMultipart(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if r.FormValue("model") != "gpt-image-1" || r.FormValue("quality") != "high" {
+		if r.FormValue("model") != "gpt-image-1" || r.FormValue("quality") != "high" || r.FormValue("input_fidelity") != "high" {
 			requestErr = fmt.Errorf("fields = %#v", r.MultipartForm.Value)
 		}
 		if files := r.MultipartForm.File["image[]"]; len(files) != 2 {
@@ -168,7 +171,7 @@ func TestOpenAIImagesReferenceUploadUsesEditsMultipart(t *testing.T) {
 	defer server.Close()
 
 	payload := buildOpenAIImagesPayload("gpt-image-1", "fallback", "edit these", 1, map[string]interface{}{
-		"size": "1024x1024", "quality": "high",
+		"size": "1024x1024", "quality": "high", "input_fidelity": "high",
 	})
 	imageData := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("\x89PNG\r\n\x1a\nimage"))
 	runtimeRule := map[string]interface{}{"upstream": map[string]interface{}{"adapter": "openai_images", "edit_endpoint": "/v1/images/edits"}}

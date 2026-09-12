@@ -29,8 +29,9 @@ bin/
 # Logs and local runtime files
 *.log
 *.err.log
-.tmp*.log
-.tmp*.err.log
+.tmp/
+.tmp-*
+.codex-tmp/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -45,6 +46,7 @@ starai-full-backup-*.tar.gz
 starai-settings-*.tar.gz
 
 # Generated uploads and local storage
+.artifacts/
 data/uploads/
 data/tmp/
 uploads/
@@ -71,8 +73,6 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
-.tmp-i18n-hardcoded.txt
-.tmp-i18n-hardcoded.txt
 
 # Generated analysis and fix reports (do not commit)
 StarAI-系统缺陷分析报告.md
