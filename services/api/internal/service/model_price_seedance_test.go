@@ -63,6 +63,14 @@ func TestEstimateSeedance2TokenCost(t *testing.T) {
 			params: map[string]interface{}{"resolution": "1080p", "duration": float64(5), "generation_mode": "image_audio"},
 			want:   12.393,
 		},
+		{
+			name: "actual upstream tokens override duration estimate",
+			params: map[string]interface{}{
+				"resolution": "720p", "duration": float64(15), "generation_mode": "text",
+				"_actual_video_tokens": float64(100000),
+			},
+			want: 4.6,
+		},
 	}
 
 	for _, tt := range tests {

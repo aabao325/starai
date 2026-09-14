@@ -59,7 +59,9 @@ const IMAGE_QUALITY_TIERS = ["1K", "2K", "4K"] as const;
 const OPENAI_IMAGE_QUALITIES = ["auto", "low", "medium", "high"] as const;
 const QWEN_IMAGE_SIZES = ["auto", "1024x1024", "1536x1024", "1024x1536", "1792x1024", "1024x1792", "2048x1536", "1536x2048", "2048x2048"] as const;
 type SeedanceVariant = "standard" | "fast" | "mini";
+type MiniMaxH3Variant = "standard" | "max";
 const MINIMAX_H3_TEMPLATE_KEY = "minimax_h3_v2";
+const MINIMAX_H3_MAX_TEMPLATE_KEY = "minimax_h3_max_v2";
 const VEO_REFERENCE_TEMPLATE_KEY = "veo_reference_v1";
 const VEO_FRAME_PAIR_TEMPLATE_KEY = "veo_frame_pair_v1";
 const OMNI_REFERENCE_TEMPLATE_KEY = "omni_reference_v1";
@@ -77,22 +79,39 @@ function canonicalTemplateVideoSize(value: unknown, fallback = "1280x720") {
   return fallback;
 }
 
-const buildMiniMaxH3PriceRule = () => ({
+const buildMiniMaxH3PriceRule = (variant: MiniMaxH3Variant = "standard") => ({
   billing_type: "dynamic",
   strategy: "minimax_h3_seconds",
   currency: "CNY",
   points_per_cny: 1,
   platform_multiplier: 1,
-  default_resolution: "2K",
+  default_resolution: variant === "max" ? "768P" : "2K",
   default_input_video_seconds: 4,
-  rates_per_second: {
-    "2k": 0.8,
-    "768p": 0.5,
-  },
+  rates_per_second: variant === "max"
+    ? { "480p": 0.33, "768p": 0.5 }
+    : { "768p": 0.5, "2k": 0.8 },
+  input_materials_billable: variant !== "max",
   free_reference_images: 5,
-  excess_image_price: 0.2,
-  fallback_cost: 4,
+  excess_image_price: variant === "max" ? 0 : 0.2,
+  fallback_cost: variant === "max" ? 2.5 : 4,
 });
+
+const MODEL_BILLING_TYPES = ["per_request", "per_second", "per_token", "per_image", "dynamic"] as const;
+type ModelBillingType = (typeof MODEL_BILLING_TYPES)[number];
+
+function switchedPriceRule(current: Record<string, any>, billingType: ModelBillingType, dynamicDefault?: Record<string, any>) {
+  const currency = current.currency || "¥";
+  if (billingType === "dynamic") return { ...(dynamicDefault || { fallback_cost: Number(current.fallback_cost ?? 1) || 1 }), billing_type: "dynamic", currency };
+  if (billingType === "per_token") {
+    return {
+      billing_type: billingType,
+      currency,
+      input_price_per_m: Number(current.input_price_per_m ?? 1) || 1,
+      output_price_per_m: Number(current.output_price_per_m ?? 1) || 1,
+    };
+  }
+  return { billing_type: billingType, currency, unit_price: Math.max(0, Number(current.unit_price ?? 1) || 0) };
+}
 
 const SEEDANCE_TOKENS_PER_SECOND: Record<string, number> = {
   "480p": 10044,
@@ -707,7 +726,7 @@ export default function ModelsPage() {
       const variant = inferSeedanceVariant(m.new_api_model, m.runtime_rule);
       setVideoTemplateKey(getSeedanceVariantConfig(variant).templateKey);
     } else if ((m.runtime_rule as any)?.upstream?.adapter === "minimax_h3_v2") {
-      setVideoTemplateKey(MINIMAX_H3_TEMPLATE_KEY);
+      setVideoTemplateKey(m.new_api_model === "MiniMax-H3-Max" ? MINIMAX_H3_MAX_TEMPLATE_KEY : MINIMAX_H3_TEMPLATE_KEY);
     } else if ((m.runtime_rule as any)?.upstream?.adapter === "veo_reference_v1") {
       setVideoTemplateKey(VEO_REFERENCE_TEMPLATE_KEY);
     } else if ((m.runtime_rule as any)?.upstream?.adapter === "veo_frame_pair_v1") {
@@ -2593,16 +2612,23 @@ export default function ModelsPage() {
     };
   };
 
-  const applyMiniMaxH3V2 = (prev: FormState): FormState => ({
+  const applyMiniMaxH3V2 = (prev: FormState, variant: MiniMaxH3Variant = "standard"): FormState => {
+    const isMax = variant === "max";
+    const resolutions = isMax ? ["480P", "768P"] : ["768P", "2K"];
+    const generationModes = isMax
+      ? ["text", "first_frame", "last_frame", "first_last"]
+      : ["text", "first_frame", "last_frame", "first_last", "reference"];
+    const durations = Array.from({ length: isMax ? 11 : 12 }, (_, index) => index + (isMax ? 5 : 4));
+    return ({
     ...prev,
     category: "video",
     request_mode: "video",
-    new_api_model: "MiniMax-H3",
+    new_api_model: isMax ? "MiniMax-H3-Max" : "MiniMax-H3",
     new_api_endpoint: "/v2/video_generation",
     new_api_extra_params: setConnection(prev.new_api_extra_params, {
       protocol: "new_api",
       auth_type: "bearer",
-      base_url: "https://api.minimaxi.com",
+      base_url: "https://api.minimax.cn",
       api_key_header: "Authorization",
     }),
     input_schema: JSON.stringify(
@@ -2612,13 +2638,13 @@ export default function ModelsPage() {
           generation_mode: {
             type: "string",
             title: "素材组合",
-            enum: ["text", "first_frame", "last_frame", "first_last", "reference"],
+            enum: generationModes,
             enumLabels: {
               text: "纯文本",
               first_frame: "首帧 + 文本",
               last_frame: "尾帧 + 文本",
               first_last: "首尾帧 + 文本",
-              reference: "多模态参考",
+              ...(!isMax ? { reference: "多模态参考" } : {}),
             },
             default: "text",
             "x-order": 1,
@@ -2629,7 +2655,7 @@ export default function ModelsPage() {
           duration: {
             type: "integer",
             title: "视频时长",
-            enum: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            enum: durations,
             enumLabels: {
               "4": "4s", "5": "5s", "6": "6s", "7": "7s", "8": "8s", "9": "9s",
               "10": "10s", "11": "11s", "12": "12s", "13": "13s", "14": "14s", "15": "15s",
@@ -2652,8 +2678,8 @@ export default function ModelsPage() {
           resolution: {
             type: "string",
             title: "视频分辨率",
-            enum: ["2K"],
-            default: "2K",
+            enum: resolutions,
+            default: isMax ? "768P" : "2K",
             "x-order": 4,
             "x-widget": "option_menu",
             "x-icon": "4k",
@@ -2676,7 +2702,7 @@ export default function ModelsPage() {
         generation_mode: "text",
         duration: 5,
         ratio: "16:9",
-        resolution: "2K",
+        resolution: isMax ? "768P" : "2K",
         aigc_watermark: false,
       },
       null,
@@ -2687,11 +2713,13 @@ export default function ModelsPage() {
         video: {
           upload_profile: "minimax_h3",
           min_reference_images: 0,
-          max_reference_images: 9,
-          max_total_images: 11,
+          max_reference_images: isMax ? 0 : 9,
+          max_total_images: isMax ? 2 : 9,
           count_toward_total: true,
           prompt_required: true,
-          prompt_hint: "描述目标视频；支持首帧、尾帧、首尾帧或图片/视频/音频多模态参考",
+          prompt_hint: isMax
+            ? "描述目标视频；支持纯文本、首帧、尾帧或首尾帧快速生成"
+            : "描述目标视频；支持首帧、尾帧、首尾帧或图片/视频/音频多模态参考",
           show_channel: false,
           show_web_search: false,
           count_options: [1],
@@ -2702,9 +2730,9 @@ export default function ModelsPage() {
             first: { key: "first_frame" },
             last: { key: "last_frame" },
           },
-          reference_images: { key: "reference_images", max: 9 },
-          reference_videos: { key: "reference_videos", max: 3, max_total_duration: 15 },
-          reference_audios: { key: "reference_audios", max: 3, max_total_duration: 15 },
+          reference_images: { key: "reference_images", max: isMax ? 0 : 9 },
+          reference_videos: { key: "reference_videos", max: isMax ? 0 : 3, max_total_duration: 15 },
+          reference_audios: { key: "reference_audios", max: isMax ? 0 : 3, max_total_duration: 15 },
         },
         upstream: {
           adapter: "minimax_h3_v2",
@@ -2731,8 +2759,9 @@ export default function ModelsPage() {
       null,
       2
     ),
-    price_rule: JSON.stringify(buildMiniMaxH3PriceRule(), null, 2),
+    price_rule: JSON.stringify(buildMiniMaxH3PriceRule(variant), null, 2),
   });
+  };
 
   const applyImageStandard = (prev: FormState): FormState => ({
     ...applyImageEndpointPreset(prev, prev.new_api_endpoint === "/v1/videos" ? "banana_async" : "openai_images"),
@@ -2790,10 +2819,6 @@ export default function ModelsPage() {
     if (isSeedance2) {
       const variant = inferSeedanceVariant(form.new_api_model, parsedRuntimeRule, videoTemplateKey);
       const config = getSeedanceVariantConfig(variant);
-      if (parsedPriceRule.billing_type !== "dynamic" || parsedPriceRule.strategy !== "seedance_2_tokens") {
-        setErr("Seedance 2.0 必须使用动态 Token 计费，请在“Seedance 2.0 动态计费”区域点击修复并设置价格");
-        return;
-      }
       const schemaResolutions = Array.isArray(parsedInputSchema?.properties?.resolution?.enum)
         ? parsedInputSchema.properties.resolution.enum.map(String)
         : [];
@@ -2802,20 +2827,22 @@ export default function ModelsPage() {
         setErr(`Seedance 2.0 ${config.label} 不支持 ${unsupportedResolution}，请重新应用对应标准模板`);
         return;
       }
-      const defaultResolution = String(parsedPriceRule.default_resolution || "");
-      if (!config.resolutions.includes(defaultResolution)) {
-        setErr(`Seedance 2.0 ${config.label} 默认分辨率必须是 ${config.resolutions.join(" / ")}`);
-        return;
-      }
-      const invalidResolution = config.resolutions.find((resolution) => {
-        const tokens = Number(parsedPriceRule.tokens_per_second?.[resolution] ?? 0);
-        const withoutVideo = Number(parsedPriceRule.rates_per_m_tokens?.[resolution]?.without_video ?? 0);
-        const withVideo = Number(parsedPriceRule.rates_per_m_tokens?.[resolution]?.with_video ?? 0);
-        return tokens <= 0 || withoutVideo <= 0 || withVideo <= 0;
-      });
-      if (invalidResolution) {
-        setErr(`Seedance 2.0 ${config.label} 的 ${invalidResolution} Token/秒及两档价格必须大于 0`);
-        return;
+      if (parsedPriceRule.billing_type === "dynamic" && parsedPriceRule.strategy === "seedance_2_tokens") {
+        const defaultResolution = String(parsedPriceRule.default_resolution || "");
+        if (!config.resolutions.includes(defaultResolution)) {
+          setErr(`Seedance 2.0 ${config.label} 默认分辨率必须是 ${config.resolutions.join(" / ")}`);
+          return;
+        }
+        const invalidResolution = config.resolutions.find((resolution) => {
+          const tokens = Number(parsedPriceRule.tokens_per_second?.[resolution] ?? 0);
+          const withoutVideo = Number(parsedPriceRule.rates_per_m_tokens?.[resolution]?.without_video ?? 0);
+          const withVideo = Number(parsedPriceRule.rates_per_m_tokens?.[resolution]?.with_video ?? 0);
+          return tokens <= 0 || withoutVideo <= 0 || withVideo <= 0;
+        });
+        if (invalidResolution) {
+          setErr(`Seedance 2.0 ${config.label} 的 ${invalidResolution} Token/秒及两档价格必须大于 0`);
+          return;
+        }
       }
       const generationModes = Array.isArray(parsedInputSchema?.properties?.generation_mode?.enum)
         ? parsedInputSchema.properties.generation_mode.enum.map(String)
@@ -2830,36 +2857,34 @@ export default function ModelsPage() {
       (parsedRuntimeRule?.upstream?.adapter === "minimax_h3_v2" ||
         parsedRuntimeRule?.video?.upload_profile === "minimax_h3");
     if (isMiniMaxH3) {
-      if (String(form.new_api_model || "").trim() !== "MiniMax-H3") {
-        setErr("MiniMax-H3 V2 官方模板的模型 ID 必须是 MiniMax-H3");
-        return;
-      }
-      if (parsedPriceRule.billing_type !== "dynamic" || parsedPriceRule.strategy !== "minimax_h3_seconds") {
-        setErr("MiniMax-H3 V2 必须使用按输出时长、参考视频时长和超额参考图动态计费");
+      const miniMaxModel = String(form.new_api_model || "").trim();
+      const isMax = miniMaxModel === "MiniMax-H3-Max";
+      if (miniMaxModel !== "MiniMax-H3" && !isMax) {
+        setErr("MiniMax V2 官方模板的模型 ID 必须是 MiniMax-H3 或 MiniMax-H3-Max");
         return;
       }
       const resolutions = Array.isArray(parsedInputSchema?.properties?.resolution?.enum)
         ? parsedInputSchema.properties.resolution.enum.map(String)
         : [];
-      if (resolutions.length !== 1 || resolutions[0].toUpperCase() !== "2K") {
-        setErr("MiniMax-H3 V2 当前公开 API 只支持 2K，请重新应用标准模板");
+      const supportedResolutions = isMax ? ["480P", "768P"] : ["768P", "2K"];
+      if (resolutions.length !== supportedResolutions.length || resolutions.some((resolution: string) => !supportedResolutions.includes(resolution.toUpperCase()))) {
+        setErr(`${miniMaxModel} 分辨率必须是 ${supportedResolutions.join(" / ")}，请重新应用标准模板`);
         return;
       }
       const modes = Array.isArray(parsedInputSchema?.properties?.generation_mode?.enum)
         ? parsedInputSchema.properties.generation_mode.enum.map(String)
         : [];
-      const requiredModes = ["text", "first_frame", "last_frame", "first_last", "reference"];
-      if (requiredModes.some((mode) => !modes.includes(mode))) {
-        setErr("MiniMax-H3 V2 素材组合不完整，请重新应用标准模板");
+      const requiredModes = isMax ? ["text", "first_frame", "last_frame", "first_last"] : ["text", "first_frame", "last_frame", "first_last", "reference"];
+      if (modes.length !== requiredModes.length || requiredModes.some((mode) => !modes.includes(mode))) {
+        setErr(`${miniMaxModel} 素材组合不完整或包含不支持的模式，请重新应用标准模板`);
         return;
       }
-      if (
-        Number(parsedPriceRule.rates_per_second?.["2k"] ?? 0) <= 0 ||
-        Number(parsedPriceRule.free_reference_images ?? -1) < 0 ||
-        Number(parsedPriceRule.excess_image_price ?? 0) <= 0
-      ) {
-        setErr("MiniMax-H3 V2 的 2K 每秒价格、免费参考图数量和超额图片价格必须有效");
-        return;
+      if (parsedPriceRule.billing_type === "dynamic" && parsedPriceRule.strategy === "minimax_h3_seconds") {
+        const invalidRate = supportedResolutions.find((resolution) => Number(parsedPriceRule.rates_per_second?.[resolution.toLowerCase()] ?? 0) <= 0);
+        if (invalidRate || (!isMax && (Number(parsedPriceRule.free_reference_images ?? -1) < 0 || Number(parsedPriceRule.excess_image_price ?? 0) <= 0))) {
+          setErr(`${miniMaxModel} 的分辨率秒价及输入素材价格必须有效`);
+          return;
+        }
       }
     }
     const isVeoReference =
@@ -3409,36 +3434,56 @@ export default function ModelsPage() {
     (videoTemplateKey.startsWith("volcengine_seedance_2_") ||
       getVideoRule(form.runtime_rule).upload_profile === "seedance_2" ||
       currentRuntimeRule?.upstream?.adapter === "volcengine_seedance_2");
-  const isLegacySeedancePrice =
+  const isSeedanceDynamicPrice =
     isSeedanceVideoForm &&
-    (currentPriceRule.billing_type !== "dynamic" || currentPriceRule.strategy !== "seedance_2_tokens");
+    currentPriceRule.billing_type === "dynamic" && currentPriceRule.strategy === "seedance_2_tokens";
+  const miniMaxH3Variant: MiniMaxH3Variant = form.new_api_model === "MiniMax-H3-Max" ? "max" : "standard";
   const isMiniMaxH3VideoForm =
     form.category === "video" &&
     (videoTemplateKey === MINIMAX_H3_TEMPLATE_KEY ||
+      videoTemplateKey === MINIMAX_H3_MAX_TEMPLATE_KEY ||
       getVideoRule(form.runtime_rule).upload_profile === "minimax_h3" ||
       currentRuntimeRule?.upstream?.adapter === "minimax_h3_v2");
   const minimaxH3PriceRule = {
-    ...buildMiniMaxH3PriceRule(),
+    ...buildMiniMaxH3PriceRule(miniMaxH3Variant),
     ...currentPriceRule,
     rates_per_second: {
-      ...buildMiniMaxH3PriceRule().rates_per_second,
+      ...buildMiniMaxH3PriceRule(miniMaxH3Variant).rates_per_second,
       ...(currentPriceRule.rates_per_second || {}),
     },
   } as Record<string, any>;
-  const isLegacyMiniMaxH3Price =
+  const isMiniMaxH3DynamicPrice =
     isMiniMaxH3VideoForm &&
-    (currentPriceRule.billing_type !== "dynamic" || currentPriceRule.strategy !== "minimax_h3_seconds");
+    currentPriceRule.billing_type === "dynamic" && currentPriceRule.strategy === "minimax_h3_seconds";
+  const videoBillingType = MODEL_BILLING_TYPES.includes(currentPriceRule.billing_type as ModelBillingType)
+    ? currentPriceRule.billing_type as ModelBillingType
+    : "per_request";
+  const setVideoBillingType = (billingType: ModelBillingType) => {
+    const dynamicDefault = isSeedanceVideoForm
+      ? buildSeedancePriceRule(seedanceVariant)
+      : isMiniMaxH3VideoForm
+        ? buildMiniMaxH3PriceRule(miniMaxH3Variant)
+        : undefined;
+    setForm((prev) => ({
+      ...prev,
+      price_rule: JSON.stringify(switchedPriceRule(safeParseJson(prev.price_rule, {}) as Record<string, any>, billingType, dynamicDefault), null, 2),
+    }));
+  };
+  const setVideoPriceValue = (key: string, value: number | string) => setForm((prev) => ({
+    ...prev,
+    price_rule: JSON.stringify({ ...(safeParseJson(prev.price_rule, {}) as Record<string, any>), [key]: value }, null, 2),
+  }));
   const setMiniMaxH3PriceValue = (key: string, value: string | number) => {
     setForm((prev) => {
       const current = safeParseJson(prev.price_rule, {}) as Record<string, any>;
       return {
         ...prev,
         price_rule: JSON.stringify({
-          ...buildMiniMaxH3PriceRule(),
+          ...buildMiniMaxH3PriceRule(miniMaxH3Variant),
           ...current,
           [key]: value,
           rates_per_second: {
-            ...buildMiniMaxH3PriceRule().rates_per_second,
+            ...buildMiniMaxH3PriceRule(miniMaxH3Variant).rates_per_second,
             ...(current.rates_per_second || {}),
           },
         }, null, 2),
@@ -3451,10 +3496,10 @@ export default function ModelsPage() {
       return {
         ...prev,
         price_rule: JSON.stringify({
-          ...buildMiniMaxH3PriceRule(),
+          ...buildMiniMaxH3PriceRule(miniMaxH3Variant),
           ...current,
           rates_per_second: {
-            ...buildMiniMaxH3PriceRule().rates_per_second,
+            ...buildMiniMaxH3PriceRule(miniMaxH3Variant).rates_per_second,
             ...(current.rates_per_second || {}),
             [resolution]: value,
           },
@@ -4473,6 +4518,8 @@ export default function ModelsPage() {
                           setForm((prev) => applyVolcengineSeedance2(prev, variant));
                         } else if (value === MINIMAX_H3_TEMPLATE_KEY) {
                           setForm((prev) => applyMiniMaxH3V2(prev));
+                        } else if (value === MINIMAX_H3_MAX_TEMPLATE_KEY) {
+                          setForm((prev) => applyMiniMaxH3V2(prev, "max"));
                         } else if (value === VEO_REFERENCE_TEMPLATE_KEY) {
                           setForm((prev) => applyVeoReferenceV1(prev));
                         } else if (value === VEO_FRAME_PAIR_TEMPLATE_KEY) {
@@ -4494,11 +4541,13 @@ export default function ModelsPage() {
                       <option value={SEEDANCE_VARIANTS.fast.templateKey}>火山方舟 · Doubao Seedance 2.0 Fast</option>
                       <option value={SEEDANCE_VARIANTS.mini.templateKey}>火山方舟 · Doubao Seedance 2.0 Mini</option>
                       <option value={MINIMAX_H3_TEMPLATE_KEY}>MiniMax 官方 · MiniMax-H3 V2</option>
+                      <option value={MINIMAX_H3_MAX_TEMPLATE_KEY}>MiniMax 官方 · MiniMax-H3-Max V2</option>
                       <option value={ALIYUN_HAPPYHORSE_TEMPLATE_KEY}>阿里云百炼 · HappyHorse 全场景</option>
                       <option value={ALIYUN_WAN3_TEMPLATE_KEY}>阿里云百炼 · Wan 3.0 全能视频</option>
                     </select>
                     {(getSeedanceVariantByTemplateKey(videoTemplateKey) ||
                       videoTemplateKey === MINIMAX_H3_TEMPLATE_KEY ||
+                      videoTemplateKey === MINIMAX_H3_MAX_TEMPLATE_KEY ||
                       videoTemplateKey === VEO_FRAME_PAIR_TEMPLATE_KEY ||
                       videoTemplateKey === VEO_REFERENCE_TEMPLATE_KEY ||
                       videoTemplateKey === OMNI_REFERENCE_TEMPLATE_KEY ||
@@ -4513,6 +4562,8 @@ export default function ModelsPage() {
                             setForm((prev) => applyVolcengineSeedance2(prev, variant));
                           } else if (videoTemplateKey === MINIMAX_H3_TEMPLATE_KEY) {
                             setForm((prev) => applyMiniMaxH3V2(prev));
+                          } else if (videoTemplateKey === MINIMAX_H3_MAX_TEMPLATE_KEY) {
+                            setForm((prev) => applyMiniMaxH3V2(prev, "max"));
                           } else if (videoTemplateKey === VEO_REFERENCE_TEMPLATE_KEY) {
                             setForm((prev) => applyVeoReferenceV1(prev));
                           } else if (videoTemplateKey === VEO_FRAME_PAIR_TEMPLATE_KEY) {
@@ -4532,36 +4583,62 @@ export default function ModelsPage() {
                     )}
                   </div>
                   <div className="mt-2 text-[11px] leading-5 text-gray-500">
-                    VEO 首尾帧模板默认使用当前更通用的 veo_3_1-fl，只接收 1 张首帧或“首帧 + 尾帧”，不提供参考图槽位；VEO 参考图模板则固定显示 8 秒，支持文生和 1～3 张参考图。Omni 模板固定 10 秒 720P，支持文生和 1～7 张参考图。三者的 JSON 图片都会自动映射到 images，固定时长不发送上游。Seedance 三个模板会分别写入官方模型 ID、分辨率和 Token 价格。MiniMax-H3 V2 会写入 V2 创建/查询接口、五种素材组合、4–15 秒、2K 和参考素材动态计费。API Key 仍需管理员填写。
+                    VEO 首尾帧模板默认使用当前更通用的 veo_3_1-fl，只接收 1 张首帧或“首帧 + 尾帧”，不提供参考图槽位；VEO 参考图模板则固定显示 8 秒，支持文生和 1～3 张参考图。Omni 模板固定 10 秒 720P，支持文生和 1～7 张参考图。三者的 JSON 图片都会自动映射到 images，固定时长不发送上游。Seedance 三个模板会分别写入官方模型 ID、分辨率和 Token 价格。MiniMax-H3 支持 768P/2K、4～15 秒及五种素材组合；H3-Max 支持 480P/768P、5～15 秒及文生/首尾帧模式。API Key 仍需管理员填写。
                   </div>
                 </div>
-                {isSeedanceVideoForm && (
-                  <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <div className="text-sm font-semibold text-gray-900">
-                          Seedance 2.0 {seedanceVariantConfig.label} 动态计费
-                        </div>
-                        <div className="mt-1 text-[11px] leading-5 text-gray-500">
-                          不是固定“算力/秒”。实际费用 = 输出时长 × 对应分辨率 Token/秒 × 价格/百万 Token；包含参考视频时使用“含视频输入”价格并计入输入视频 Token。
-                        </div>
-                      </div>
-                      {isLegacySeedancePrice && (
-                        <button
-                          type="button"
-                          className="shrink-0 rounded-lg bg-amber-500 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-600"
-                          onClick={() => setForm((prev) => ({ ...prev, price_rule: JSON.stringify(buildSeedancePriceRule(seedanceVariant), null, 2) }))}
-                        >
-                          修复为动态计费
-                        </button>
-                      )}
-                    </div>
-                    {isLegacySeedancePrice && (
-                      <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-600">
-                        当前仍是旧计费规则：{String(currentPriceRule.billing_type || "未配置")}
-                        {currentPriceRule.unit_price != null ? `，单价 ${currentPriceRule.unit_price}` : ""}。请点击“修复为动态计费”后保存模型。
-                      </div>
+                <div className="rounded-xl border border-cyan-200 bg-cyan-50/50 p-4">
+                  <div className="flex flex-wrap items-end gap-3">
+                    <label className="min-w-[210px] flex-1 text-xs text-gray-500">
+                      用户售价计费方式
+                      <select
+                        className="mt-1 w-full rounded-lg border bg-white px-3 py-2 text-sm"
+                        value={videoBillingType}
+                        onChange={(e) => setVideoBillingType(e.target.value as ModelBillingType)}
+                      >
+                        <option value="per_request">按次</option>
+                        <option value="per_second">按秒</option>
+                        <option value="per_token">按 Token</option>
+                        <option value="per_image">按生成结果</option>
+                        <option value="dynamic">动态规则</option>
+                      </select>
+                    </label>
+                    {(["per_request", "per_second", "per_image"] as ModelBillingType[]).includes(videoBillingType) && (
+                      <SeedancePriceInput
+                        label={videoBillingType === "per_request" ? "每次算力" : videoBillingType === "per_second" ? "每秒算力" : "每个结果算力"}
+                        value={Number(currentPriceRule.unit_price ?? 1)}
+                        step={0.01}
+                        onChange={(value) => setVideoPriceValue("unit_price", value)}
+                      />
                     )}
+                    {videoBillingType === "per_token" && (
+                      <>
+                        <SeedancePriceInput label="输入算力 / 1M Token" value={Number(currentPriceRule.input_price_per_m ?? 1)} step={0.01} onChange={(value) => setVideoPriceValue("input_price_per_m", value)} />
+                        <SeedancePriceInput label="输出算力 / 1M Token" value={Number(currentPriceRule.output_price_per_m ?? 1)} step={0.01} onChange={(value) => setVideoPriceValue("output_price_per_m", value)} />
+                      </>
+                    )}
+                    {videoBillingType === "dynamic" && !isSeedanceDynamicPrice && !isMiniMaxH3DynamicPrice && (
+                      <SeedancePriceInput label="动态估价兜底算力" value={Number(currentPriceRule.fallback_cost ?? 1)} step={0.01} onChange={(value) => setVideoPriceValue("fallback_cost", value)} />
+                    )}
+                    <label className="w-28 text-xs text-gray-500">
+                      币种
+                      <input className="mt-1 w-full rounded-lg border bg-white px-3 py-2 text-sm" value={String(currentPriceRule.currency || "POINT")} onChange={(e) => setVideoPriceValue("currency", e.target.value)} />
+                    </label>
+                  </div>
+                  <div className="mt-2 text-[11px] leading-5 text-gray-500">
+                    这里控制向用户扣费的模型价格规则；上游成本仍在“上游线路”的成本计费方式中独立配置。
+                    {(isSeedanceVideoForm || isMiniMaxH3VideoForm) && videoBillingType !== "dynamic" && " 可随时切回动态规则以按官方用量精确计费。"}
+                  </div>
+                </div>
+                {isSeedanceDynamicPrice && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4">
+                    <div>
+                      <div className="text-sm font-semibold text-gray-900">
+                        Seedance 2.0 {seedanceVariantConfig.label} 动态计费
+                      </div>
+                      <div className="mt-1 text-[11px] leading-5 text-gray-500">
+                        任务完成后优先按上游真实视频 Token 结算；预估阶段使用输出时长、分辨率及参考视频时长计算。
+                      </div>
+                    </div>
                     <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-5">
                       <label className="text-xs text-gray-500">
                         默认分辨率
@@ -4611,41 +4688,33 @@ export default function ModelsPage() {
                     </div>
                   </div>
                 )}
-                {isMiniMaxH3VideoForm && (
+                {isMiniMaxH3DynamicPrice && (
                   <div className="rounded-xl border border-violet-200 bg-violet-50/60 p-4">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <div className="text-sm font-semibold text-gray-900">MiniMax-H3 V2 动态计费</div>
-                        <div className="mt-1 text-[11px] leading-5 text-gray-500">
-                          费用 = 输出视频秒数 × 2K 单价 + 参考视频秒数 × 2K 单价 + 超出免费额度的参考图片数 × 图片单价。参考音频不单独计费。
-                        </div>
+                    <div>
+                      <div className="text-sm font-semibold text-gray-900">{form.new_api_model} V2 动态计费</div>
+                      <div className="mt-1 text-[11px] leading-5 text-gray-500">
+                        {miniMaxH3Variant === "max"
+                          ? "H3-Max 仅按输出视频秒数与分辨率计费，输入图片不计费。"
+                          : "H3 按输出视频秒数、参考视频秒数及超出免费额度的参考图片数计费；参考音频不单独计费。"}
                       </div>
-                      {isLegacyMiniMaxH3Price && (
-                        <button
-                          type="button"
-                          className="shrink-0 rounded-lg bg-violet-500 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-600"
-                          onClick={() => setForm((prev) => ({ ...prev, price_rule: JSON.stringify(buildMiniMaxH3PriceRule(), null, 2) }))}
-                        >
-                          修复为官方动态计费
-                        </button>
-                      )}
                     </div>
-                    {isLegacyMiniMaxH3Price && (
-                      <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-600">
-                        当前不是 MiniMax-H3 V2 动态计费规则，保存前请点击修复。
-                      </div>
-                    )}
                     <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
-                      <SeedancePriceInput label="2K 单价（元/秒）" value={Number(minimaxH3PriceRule.rates_per_second?.["2k"] ?? 0.8)} step={0.01} onChange={(value) => setMiniMaxH3Rate("2k", value)} />
-                      <SeedancePriceInput label="免费参考图片数" value={Number(minimaxH3PriceRule.free_reference_images ?? 5)} step={1} onChange={(value) => setMiniMaxH3PriceValue("free_reference_images", value)} />
-                      <SeedancePriceInput label="超额图片（元/张）" value={Number(minimaxH3PriceRule.excess_image_price ?? 0.2)} step={0.01} onChange={(value) => setMiniMaxH3PriceValue("excess_image_price", value)} />
-                      <SeedancePriceInput label="默认参考视频秒数" value={Number(minimaxH3PriceRule.default_input_video_seconds ?? 4)} step={0.1} onChange={(value) => setMiniMaxH3PriceValue("default_input_video_seconds", value)} />
+                      {(miniMaxH3Variant === "max" ? ["480p", "768p"] : ["768p", "2k"]).map((resolution) => (
+                        <SeedancePriceInput key={resolution} label={`${resolution.toUpperCase()} 单价（元/秒）`} value={Number(minimaxH3PriceRule.rates_per_second?.[resolution] ?? 0)} step={0.01} onChange={(value) => setMiniMaxH3Rate(resolution, value)} />
+                      ))}
+                      {miniMaxH3Variant === "standard" && (
+                        <>
+                          <SeedancePriceInput label="免费参考图片数" value={Number(minimaxH3PriceRule.free_reference_images ?? 5)} step={1} onChange={(value) => setMiniMaxH3PriceValue("free_reference_images", value)} />
+                          <SeedancePriceInput label="超额图片（元/张）" value={Number(minimaxH3PriceRule.excess_image_price ?? 0.2)} step={0.01} onChange={(value) => setMiniMaxH3PriceValue("excess_image_price", value)} />
+                          <SeedancePriceInput label="默认参考视频秒数" value={Number(minimaxH3PriceRule.default_input_video_seconds ?? 4)} step={0.1} onChange={(value) => setMiniMaxH3PriceValue("default_input_video_seconds", value)} />
+                        </>
+                      )}
                       <SeedancePriceInput label="算力点/元" value={Number(minimaxH3PriceRule.points_per_cny ?? 1)} step={0.01} onChange={(value) => setMiniMaxH3PriceValue("points_per_cny", value)} />
                       <SeedancePriceInput label="平台倍率" value={Number(minimaxH3PriceRule.platform_multiplier ?? 1)} step={0.01} onChange={(value) => setMiniMaxH3PriceValue("platform_multiplier", value)} />
-                      <SeedancePriceInput label="估价兜底算力" value={Number(minimaxH3PriceRule.fallback_cost ?? 4)} step={0.01} onChange={(value) => setMiniMaxH3PriceValue("fallback_cost", value)} />
+                      <SeedancePriceInput label="估价兜底算力" value={Number(minimaxH3PriceRule.fallback_cost ?? (miniMaxH3Variant === "max" ? 2.5 : 4))} step={0.01} onChange={(value) => setMiniMaxH3PriceValue("fallback_cost", value)} />
                     </div>
                     <div className="mt-3 text-[11px] leading-5 text-gray-500">
-                      当前公开创建接口只开放 2K。768P 价格仅保留在规则中供后续官方开放时兼容，不在前台参数中暴露，避免提交无效分辨率。
+                      任务完成后优先使用上游返回的实际输出秒数、输入视频秒数和输入图片数量结算；上游未返回 usage 时才使用提交参数估算。
                     </div>
                   </div>
                 )}
@@ -5339,10 +5408,10 @@ export default function ModelsPage() {
               onPrimaryBillingTypeChange={(billingType) => {
                 setForm((current) => ({
                   ...current,
-                  price_rule: JSON.stringify({
-                    ...(safeParseJson(current.price_rule, {}) as Record<string, unknown>),
-                    billing_type: billingType,
-                  }, null, 2),
+                  price_rule: JSON.stringify(switchedPriceRule(
+                    safeParseJson(current.price_rule, {}) as Record<string, any>,
+                    billingType as ModelBillingType
+                  ), null, 2),
                 }));
               }}
               onPrimaryConnectionChange={(connection) => {

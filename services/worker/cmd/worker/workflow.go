@@ -2746,6 +2746,9 @@ func estimatePriceRuleCostWorker(rule map[string]interface{}, params map[string]
 		return cost * count
 	case "per_second":
 		duration := workerDurationSeconds(params)
+		if actual := floatAny(params["_actual_output_seconds"]); actual > 0 {
+			duration = actual
+		}
 		n := floatAny(params["count"])
 		if n <= 0 {
 			n = floatAny(params["n"])
@@ -2849,23 +2852,39 @@ func estimateMiniMaxH3PriceRuleCostWorker(rule, params map[string]interface{}) f
 	resolution := strings.ToLower(strings.TrimSpace(firstNonEmpty(stringAny(params["resolution"]), stringAny(rule["default_resolution"]), "2k")))
 	rate := nestedWorkerFloat(rule["rates_per_second"], resolution, "")
 	if rate <= 0 {
-		rate = map[string]float64{"2k": 0.8, "768p": 0.5}[resolution]
+		rate = map[string]float64{"2k": 0.8, "768p": 0.5, "480p": 0.33}[resolution]
 	}
 	if rate <= 0 {
 		return floatAny(rule["fallback_cost"])
 	}
 	outputSeconds := workerDurationSeconds(params)
-	videoCount := workerURLFieldCount(params["reference_videos"])
-	inputSeconds := floatAny(params["reference_video_duration_seconds"])
-	if videoCount > 0 && inputSeconds <= 0 {
-		inputSeconds = float64(videoCount) * floatAny(rule["default_input_video_seconds"])
-		if inputSeconds <= 0 {
-			inputSeconds = float64(videoCount) * 4
+	if actual := floatAny(params["_actual_output_seconds"]); actual > 0 {
+		outputSeconds = actual
+	}
+	inputMaterialsBillable := true
+	if configured, ok := rule["input_materials_billable"].(bool); ok {
+		inputMaterialsBillable = configured
+	}
+	inputSeconds := 0.0
+	imageCount := 0
+	if inputMaterialsBillable {
+		videoCount := workerURLFieldCount(params["reference_videos"])
+		inputSeconds = floatAny(params["reference_video_duration_seconds"])
+		if _, exists := params["_actual_input_seconds"]; exists {
+			inputSeconds = math.Max(0, floatAny(params["_actual_input_seconds"]))
+		} else if videoCount > 0 && inputSeconds <= 0 {
+			inputSeconds = float64(videoCount) * floatAny(rule["default_input_video_seconds"])
+			if inputSeconds <= 0 {
+				inputSeconds = float64(videoCount) * 4
+			}
+		}
+		imageCount = workerURLFieldCount(params["reference_images"]) +
+			workerURLFieldCount(params["first_frame"]) +
+			workerURLFieldCount(params["last_frame"])
+		if _, exists := params["_actual_input_image_count"]; exists {
+			imageCount = int(floatAny(params["_actual_input_image_count"]))
 		}
 	}
-	imageCount := workerURLFieldCount(params["reference_images"]) +
-		workerURLFieldCount(params["first_frame"]) +
-		workerURLFieldCount(params["last_frame"])
 	freeImages := int(floatAny(rule["free_reference_images"]))
 	if freeImages < 0 {
 		freeImages = 0
@@ -2875,7 +2894,7 @@ func estimateMiniMaxH3PriceRuleCostWorker(rule, params map[string]interface{}) f
 		excessImages = 0
 	}
 	imagePrice := floatAny(rule["excess_image_price"])
-	if imagePrice <= 0 {
+	if _, configured := rule["excess_image_price"]; inputMaterialsBillable && !configured {
 		imagePrice = 0.2
 	}
 	multiplier := floatAny(rule["platform_multiplier"])
@@ -2914,23 +2933,31 @@ func estimateSeedance2PriceRuleCostWorker(rule, params map[string]interface{}) f
 		}
 		rate = defaultRates[resolution][rateKind]
 	}
-	duration := workerDurationSeconds(params)
-	tokens := duration * tokensPerSecond
-	if hasVideo {
-		inputDuration := floatAny(params["reference_video_duration_seconds"])
-		if inputDuration <= 0 {
-			inputDuration = floatAny(rule["default_input_video_seconds"])
+	tokens := floatAny(params["_actual_video_tokens"])
+	if tokens <= 0 {
+		duration := workerDurationSeconds(params)
+		if actual := floatAny(params["_actual_output_seconds"]); actual > 0 {
+			duration = actual
 		}
-		if inputDuration <= 0 {
-			inputDuration = 4
-		}
-		tokens = (duration + inputDuration) * tokensPerSecond
-		minMultiplier := floatAny(rule["video_min_token_multiplier"])
-		if minMultiplier <= 0 {
-			minMultiplier = 1.8
-		}
-		if minimum := duration * tokensPerSecond * minMultiplier; tokens < minimum {
-			tokens = minimum
+		tokens = duration * tokensPerSecond
+		if hasVideo {
+			inputDuration := floatAny(params["reference_video_duration_seconds"])
+			if _, exists := params["_actual_input_seconds"]; exists {
+				inputDuration = math.Max(0, floatAny(params["_actual_input_seconds"]))
+			} else if inputDuration <= 0 {
+				inputDuration = floatAny(rule["default_input_video_seconds"])
+			}
+			if inputDuration <= 0 {
+				inputDuration = 4
+			}
+			tokens = (duration + inputDuration) * tokensPerSecond
+			minMultiplier := floatAny(rule["video_min_token_multiplier"])
+			if minMultiplier <= 0 {
+				minMultiplier = 1.8
+			}
+			if minimum := duration * tokensPerSecond * minMultiplier; tokens < minimum {
+				tokens = minimum
+			}
 		}
 	}
 	multiplier := floatAny(rule["platform_multiplier"])

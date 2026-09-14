@@ -418,6 +418,55 @@ func validateVideoUpload(cfg videoRuntimeConfig, params map[string]interface{}) 
 		if cfg.MaxTotalImages > 0 && total > cfg.MaxTotalImages {
 			return errors.New("上传图片总数超过模型限制")
 		}
+	case "minimax_h3":
+		videoCount := urlFieldCount(params[cfg.ReferenceVideosKey])
+		audioCount := urlFieldCount(params[cfg.ReferenceAudiosKey])
+		prompt := strings.TrimSpace(fmt.Sprint(params["prompt"]))
+		if prompt == "" || prompt == "<nil>" {
+			return errors.New("MiniMax-H3 视频生成需要填写提示词")
+		}
+		if refCount > cfg.MaxReferenceImages || videoCount > cfg.MaxReferenceVideos || audioCount > cfg.MaxReferenceAudios {
+			return errors.New("参考素材数量超过 MiniMax-H3 模型限制")
+		}
+		if cfg.MaxTotalImages > 0 && refCount+firstCount+lastCount > cfg.MaxTotalImages {
+			return errors.New("上传图片总数超过 MiniMax-H3 模型限制")
+		}
+		if raw, exists := params["reference_video_duration_seconds"]; exists && videoCount > 0 {
+			if seconds, valid := schemaDurationSeconds(raw); !valid || seconds <= 0 || seconds > 15 {
+				return errors.New("MiniMax-H3 参考视频总时长必须在 0～15 秒之间")
+			}
+		}
+		mode := strings.ToLower(strings.TrimSpace(fmt.Sprint(params[cfg.ModeParam])))
+		switch mode {
+		case "", "text":
+			if firstCount+lastCount+refCount+videoCount+audioCount > 0 {
+				return errors.New("MiniMax-H3 文生视频模式不接收参考素材")
+			}
+		case "first_frame":
+			if firstCount != 1 || lastCount+refCount+videoCount+audioCount > 0 {
+				return errors.New("MiniMax-H3 首帧模式仅支持上传 1 张首帧图片")
+			}
+		case "last_frame":
+			if lastCount != 1 || firstCount+refCount+videoCount+audioCount > 0 {
+				return errors.New("MiniMax-H3 尾帧模式仅支持上传 1 张尾帧图片")
+			}
+		case "first_last":
+			if firstCount != 1 || lastCount != 1 || refCount+videoCount+audioCount > 0 {
+				return errors.New("MiniMax-H3 首尾帧模式仅支持同时上传首帧和尾帧")
+			}
+		case "reference":
+			if cfg.MaxReferenceImages == 0 && cfg.MaxReferenceVideos == 0 && cfg.MaxReferenceAudios == 0 {
+				return errors.New("当前 MiniMax-H3 模型不支持多模态参考模式")
+			}
+			if refCount+videoCount+audioCount == 0 {
+				return errors.New("MiniMax-H3 多模态参考模式至少需要 1 个参考素材")
+			}
+			if firstCount+lastCount > 0 {
+				return errors.New("MiniMax-H3 多模态参考素材不能与首尾帧混用")
+			}
+		default:
+			return errors.New("不支持的 MiniMax-H3 生成模式")
+		}
 	case "seedance_2":
 		videoCount := urlFieldCount(params[cfg.ReferenceVideosKey])
 		audioCount := urlFieldCount(params[cfg.ReferenceAudiosKey])

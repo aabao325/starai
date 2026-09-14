@@ -42,6 +42,14 @@ func TestEstimateDynamicPriceRuleCostWorkerSeedance2(t *testing.T) {
 	if math.Abs(videoCost-wantVideo) > 0.000001 {
 		t.Fatalf("video cost = %f, want %f", videoCost, wantVideo)
 	}
+
+	actualCost := estimatePriceRuleCostWorker(rule, map[string]interface{}{
+		"resolution": "720p", "duration": float64(15), "generation_mode": "text",
+		"_actual_video_tokens": float64(100000),
+	}, 0, 0, 0, 0)
+	if want := float64(100000) / 1_000_000 * 46; math.Abs(actualCost-want) > 0.000001 {
+		t.Fatalf("actual-token cost = %f, want %f", actualCost, want)
+	}
 }
 
 func TestEstimateDynamicPriceRuleCostWorkerMiniMaxH3(t *testing.T) {
@@ -69,6 +77,27 @@ func TestEstimateDynamicPriceRuleCostWorkerMiniMaxH3(t *testing.T) {
 	}
 }
 
+func TestEstimateDynamicPriceRuleCostWorkerUsesMiniMaxActualUsage(t *testing.T) {
+	rule := map[string]interface{}{
+		"billing_type":          "dynamic",
+		"strategy":              "minimax_h3_seconds",
+		"free_reference_images": float64(5),
+		"excess_image_price":    float64(0.2),
+		"rates_per_second":      map[string]interface{}{"768p": float64(0.5)},
+	}
+	params := map[string]interface{}{
+		"resolution":                "768P",
+		"duration":                  float64(5),
+		"_actual_output_seconds":    float64(7),
+		"_actual_input_seconds":     float64(3),
+		"_actual_input_image_count": float64(8),
+	}
+	want := float64(10)*0.5 + float64(3)*0.2
+	if got := estimatePriceRuleCostWorker(rule, params, 0, 0, 0, 0); math.Abs(got-want) > 0.000001 {
+		t.Fatalf("actual MiniMax cost = %f, want %f", got, want)
+	}
+}
+
 func TestEstimatePriceRuleCostWorkerUsesImageSizeTier(t *testing.T) {
 	rule := map[string]interface{}{
 		"billing_type": "per_image",
@@ -92,6 +121,16 @@ func TestWorkerRouteProviderCostUsesImageSizeTier(t *testing.T) {
 	}}
 	if got := workerRouteProviderCost(route, map[string]interface{}{"image_size": "2K", "count": float64(2)}, 0, 0, 0, 0); got != 0.24 {
 		t.Fatalf("provider cost = %v, want 0.24", got)
+	}
+}
+
+func TestWorkerRouteProviderCostSupportsDurationStringAndActualUsage(t *testing.T) {
+	route := workerModelRoute{CostRule: map[string]interface{}{"billing_type": "per_second", "unit_cost": float64(0.25)}}
+	if got := workerRouteProviderCost(route, map[string]interface{}{"duration": "8s"}, 0, 0, 0, 0); got != 2 {
+		t.Fatalf("provider duration-string cost = %v, want 2", got)
+	}
+	if got := workerRouteProviderCost(route, map[string]interface{}{"duration": "8s", "_actual_output_seconds": float64(10)}, 0, 0, 0, 0); got != 2.5 {
+		t.Fatalf("provider actual-duration cost = %v, want 2.5", got)
 	}
 }
 
@@ -201,5 +240,26 @@ func TestUpstreamUsageTokensSupportsNestedUsage(t *testing.T) {
 	prompt, output := upstreamUsageTokens([]byte(`{"data":{"result":{"usage":{"input_tokens":120,"output_tokens":45}}}}`))
 	if prompt != 120 || output != 45 {
 		t.Fatalf("usage = %d/%d, want 120/45", prompt, output)
+	}
+}
+
+func TestUpstreamUsageSupportsMiniMaxH3SecondsAndImages(t *testing.T) {
+	usage := upstreamUsageFromBody([]byte(`{"task":{"usage":{"total_seconds":17,"input_seconds":9,"output_seconds":8,"input_image_count":7,"input_tokens":120,"output_tokens":45}}}`))
+	if usage.PromptTokens != 120 || usage.OutputTokens != 45 || usage.InputSeconds != 9 || usage.OutputSeconds != 8 || usage.InputImageCount != 7 {
+		t.Fatalf("unexpected MiniMax usage: %#v", usage)
+	}
+	if !usage.HasInputSeconds || !usage.HasOutputSeconds || !usage.HasInputImageCount {
+		t.Fatalf("MiniMax usage presence flags missing: %#v", usage)
+	}
+}
+
+func TestUpstreamUsageMapsSeedanceTotalTokensToActualBilling(t *testing.T) {
+	usage := upstreamUsageFromBody([]byte(`{"data":{"usage":{"total_tokens":108900}}}`))
+	if usage.VideoTokens != 108900 || usage.OutputTokens != 108900 {
+		t.Fatalf("unexpected Seedance usage: %#v", usage)
+	}
+	input := inputWithActualUpstreamUsage(map[string]interface{}{"duration": float64(5)}, usage)
+	if got := intAny(input["_actual_video_tokens"]); got != 108900 {
+		t.Fatalf("actual video tokens = %d, want 108900", got)
 	}
 }

@@ -373,7 +373,7 @@ func TestPlatformAsyncTaskResponseUsesPollURL(t *testing.T) {
 	if pollPath != "/v1/tasks/task-production-1" {
 		t.Fatalf("poll path = %q", pollPath)
 	}
-	items, _, _, err := pollUpstreamTask(context.Background(), nil, connectionConfig{BaseURL: server.URL, AuthType: "none"}, pollConfig{
+	items, _, err := pollUpstreamTask(context.Background(), nil, connectionConfig{BaseURL: server.URL, AuthType: "none"}, pollConfig{
 		Path: pollPath, Interval: time.Millisecond, Timeout: time.Second,
 	}, upstreamID, "local-task-1")
 	if err != nil {
@@ -417,7 +417,7 @@ func TestDashScopeAsyncTaskRequestHeaders(t *testing.T) {
 	if _, statusCode, err := doJSONRequest(context.Background(), conn, http.MethodPost, server.URL+"/video-synthesis", []byte(`{}`), time.Second); err != nil || statusCode != http.StatusOK {
 		t.Fatalf("create request status=%d err=%v", statusCode, err)
 	}
-	items, _, _, err := pollUpstreamTask(context.Background(), nil, conn, pollConfig{Path: "/tasks/{id}", Interval: time.Millisecond, Timeout: time.Second}, "task-1", "local-task-header")
+	items, _, err := pollUpstreamTask(context.Background(), nil, conn, pollConfig{Path: "/tasks/{id}", Interval: time.Millisecond, Timeout: time.Second}, "task-1", "local-task-header")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +443,7 @@ func TestPollUpstreamTaskSupportsPostBodyAndNumericSuccess(t *testing.T) {
 	}))
 	defer server.Close()
 
-	items, _, _, err := pollUpstreamTask(context.Background(), nil, connectionConfig{BaseURL: server.URL, AuthType: "none"}, pollConfig{
+	items, _, err := pollUpstreamTask(context.Background(), nil, connectionConfig{BaseURL: server.URL, AuthType: "none"}, pollConfig{
 		Path: "/v1/aiart/query", Method: http.MethodPost, Body: map[string]interface{}{"job_id": "{id}"},
 		Interval: time.Millisecond, Timeout: time.Second,
 	}, "job-123", "local-task-post")

@@ -372,7 +372,7 @@ routeLoop:
 		_, _ = pool.Exec(ctx, `UPDATE tasks SET upstream_task_id=$1,route_id=$2,updated_at=now() WHERE task_no=$3`, upstreamID, nullableRouteID(selected.Route.ID), p.TaskNo)
 	}
 
-	promptTokens, outputTokens := upstreamUsageTokens(respBody)
+	usage := upstreamUsageFromBody(respBody)
 	if !(isImage && isVideoImageAPI(endpoint, newAPIModel)) {
 		resultData, upstreamID = parseUpstreamMedia(respBody)
 		if upstreamID != "" {
@@ -384,14 +384,14 @@ routeLoop:
 				pollCfg.Path = responsePollPath
 			}
 			log.Printf("Task %s upstream async id=%s poll=%s interval=%s timeout=%s", p.TaskNo, upstreamID, pollCfg.Path, pollCfg.Interval, pollCfg.Timeout)
-			var pollPromptTokens, pollOutputTokens int
-			resultData, pollPromptTokens, pollOutputTokens, err = pollUpstreamTask(ctx, pool, conn, pollCfg, upstreamID, p.TaskNo)
+			var pollUsage upstreamUsageDetails
+			resultData, pollUsage, err = pollUpstreamTask(ctx, pool, conn, pollCfg, upstreamID, p.TaskNo)
 			if err != nil {
 				log.Printf("Task %s poll failed: %v", p.TaskNo, err)
 				return failTask(ctx, pool, p, "MODEL_PROVIDER_ERROR", err.Error())
 			}
-			if pollPromptTokens > 0 || pollOutputTokens > 0 {
-				promptTokens, outputTokens = pollPromptTokens, pollOutputTokens
+			if pollUsage.hasAny() {
+				usage = pollUsage
 			}
 		}
 	}
@@ -414,10 +414,11 @@ routeLoop:
 	var estimated float64
 	pool.QueryRow(ctx, `SELECT id, estimated_cost FROM tasks WHERE task_no=$1`, p.TaskNo).Scan(&taskID, &estimated)
 	actualCost := estimated
-	if promptTokens > 0 || outputTokens > 0 {
-		actualCost = estimateModelCostByIDWorker(ctx, pool, p.ModelID, p.Input, promptTokens, outputTokens, 0, 0)
+	billingInput := inputWithActualUpstreamUsage(p.Input, usage)
+	if usage.hasAny() {
+		actualCost = estimateModelCostByIDWorker(ctx, pool, p.ModelID, billingInput, usage.PromptTokens, usage.OutputTokens, 0, 0)
 	}
-	providerCost := workerRouteProviderCost(selected.Route, p.Input, promptTokens, outputTokens, 0, 0)
+	providerCost := workerRouteProviderCost(selected.Route, billingInput, usage.PromptTokens, usage.OutputTokens, 0, 0)
 	updateWorkerRouteAttemptProviderCost(ctx, pool, p.TaskNo, selected.Route.ID, providerCost)
 
 	var output, meta []byte
@@ -930,7 +931,10 @@ func workerRouteProviderCost(route workerModelRoute, input map[string]interface{
 		}
 		return float64(count) * unitCost
 	case "per_second":
-		seconds := floatAny(input["duration"])
+		seconds := floatAny(input["_actual_output_seconds"])
+		if seconds <= 0 {
+			seconds = workerDurationSeconds(input)
+		}
 		if seconds <= 0 {
 			seconds = 1
 		}
@@ -1989,7 +1993,7 @@ func runBananaImageBatch(ctx context.Context, pool *pgxpool.Pool, conn connectio
 		}
 		if len(items) == 0 && upstreamID != "" {
 			log.Printf("Task %s banana image #%d/%d async id=%s poll=%s", taskNo, i+1, count, upstreamID, pollCfg.Path)
-			items, _, _, err = pollUpstreamTask(ctx, pool, conn, pollCfg, upstreamID, taskNo)
+			items, _, err = pollUpstreamTask(ctx, pool, conn, pollCfg, upstreamID, taskNo)
 			if err != nil {
 				return nil, strings.Join(upstreamIDs, ","), err
 			}
@@ -3201,7 +3205,7 @@ func parseProgressPercent(raw string) int {
 	return -1
 }
 
-func pollUpstreamTask(ctx context.Context, pool *pgxpool.Pool, conn connectionConfig, cfg pollConfig, upstreamID, taskNo string) ([]mediaItem, int, int, error) {
+func pollUpstreamTask(ctx context.Context, pool *pgxpool.Pool, conn connectionConfig, cfg pollConfig, upstreamID, taskNo string) ([]mediaItem, upstreamUsageDetails, error) {
 	pollConn := connectionForTaskPoll(conn)
 	escapedID := url.PathEscape(upstreamID)
 	pollURL := joinBaseEndpoint(conn.BaseURL, strings.Replace(cfg.Path, "{id}", escapedID, 1))
@@ -3233,7 +3237,7 @@ func pollUpstreamTask(ctx context.Context, pool *pgxpool.Pool, conn connectionCo
 			continue
 		}
 		if statusCode == 404 {
-			return nil, 0, 0, fmt.Errorf("上游任务不存在(404)，请检查 poll_path 与任务 ID")
+			return nil, upstreamUsageDetails{}, fmt.Errorf("上游任务不存在(404)，请检查 poll_path 与任务 ID")
 		}
 		if statusCode >= 400 {
 			consecutiveErrors++
@@ -3241,7 +3245,7 @@ func pollUpstreamTask(ctx context.Context, pool *pgxpool.Pool, conn connectionCo
 				log.Printf("Task %s poll #%d HTTP %d: %s", taskNo, attempt, statusCode, truncateText(string(body), 300))
 			}
 			if consecutiveErrors >= 12 {
-				return nil, 0, 0, fmt.Errorf("上游轮询持续失败(HTTP %d): %s", statusCode, truncateText(upstreamErrorMessage(body), 200))
+				return nil, upstreamUsageDetails{}, fmt.Errorf("上游轮询持续失败(HTTP %d): %s", statusCode, truncateText(upstreamErrorMessage(body), 200))
 			}
 			time.Sleep(cfg.Interval)
 			continue
@@ -3279,20 +3283,18 @@ func pollUpstreamTask(ctx context.Context, pool *pgxpool.Pool, conn connectionCo
 			if msg == "" || msg == "模型服务异常" {
 				msg = "上游任务失败"
 			}
-			return nil, 0, 0, fmt.Errorf("%s", humanizeUpstreamFailure(msg))
+			return nil, upstreamUsageDetails{}, fmt.Errorf("%s", humanizeUpstreamFailure(msg))
 		case "succeeded", "success", "completed", "done", "finished", "5":
 			if failMsg := upstreamContentFailure(raw); failMsg != "" {
-				return nil, 0, 0, fmt.Errorf("%s", failMsg)
+				return nil, upstreamUsageDetails{}, fmt.Errorf("%s", failMsg)
 			}
 			if items := extractMediaItems(raw); len(items) > 0 {
 				log.Printf("Task %s poll #%d got %d media item(s)", taskNo, attempt, len(items))
-				promptTokens, outputTokens := upstreamUsageTokens(body)
-				return items, promptTokens, outputTokens, nil
+				return items, upstreamUsageFromBody(body), nil
 			}
 			if mediaURL := firstSuccessMediaURL(raw, upstreamID, conn); mediaURL != "" {
 				log.Printf("Task %s poll #%d got media url: %s", taskNo, attempt, truncateText(mediaURL, 100))
-				promptTokens, outputTokens := upstreamUsageTokens(body)
-				return []mediaItem{{URL: mediaURL}}, promptTokens, outputTokens, nil
+				return []mediaItem{{URL: mediaURL}}, upstreamUsageFromBody(body), nil
 			}
 			successPolls++
 			if successPolls < maxSuccessWait {
@@ -3305,7 +3307,7 @@ func pollUpstreamTask(ctx context.Context, pool *pgxpool.Pool, conn connectionCo
 				time.Sleep(cfg.Interval)
 				continue
 			}
-			return nil, 0, 0, fmt.Errorf("上游未返回可下载的视频地址，请稍后重试: %s", truncateText(string(body), 400))
+			return nil, upstreamUsageDetails{}, fmt.Errorf("上游未返回可下载的视频地址，请稍后重试: %s", truncateText(string(body), 400))
 		case "queued", "in_progress", "processing", "pending", "running", "not_start", "":
 			// keep polling
 		default:
@@ -3315,23 +3317,91 @@ func pollUpstreamTask(ctx context.Context, pool *pgxpool.Pool, conn connectionCo
 		}
 		time.Sleep(cfg.Interval)
 	}
-	return nil, 0, 0, fmt.Errorf("生成超时（已轮询 %s），请稍后重试", cfg.Timeout)
+	return nil, upstreamUsageDetails{}, fmt.Errorf("生成超时（已轮询 %s），请稍后重试", cfg.Timeout)
+}
+
+type upstreamUsageDetails struct {
+	PromptTokens       int
+	OutputTokens       int
+	VideoTokens        int
+	InputSeconds       float64
+	OutputSeconds      float64
+	InputImageCount    int
+	HasInputSeconds    bool
+	HasOutputSeconds   bool
+	HasInputImageCount bool
+}
+
+func (u upstreamUsageDetails) hasAny() bool {
+	return u.PromptTokens > 0 || u.OutputTokens > 0 || u.VideoTokens > 0 || u.HasInputSeconds || u.HasOutputSeconds || u.HasInputImageCount
+}
+
+func inputWithActualUpstreamUsage(input map[string]interface{}, usage upstreamUsageDetails) map[string]interface{} {
+	if usage.VideoTokens <= 0 && !usage.HasInputSeconds && !usage.HasOutputSeconds && !usage.HasInputImageCount {
+		return input
+	}
+	out := make(map[string]interface{}, len(input)+4)
+	for key, value := range input {
+		out[key] = value
+	}
+	if usage.HasInputSeconds {
+		out["_actual_input_seconds"] = usage.InputSeconds
+	}
+	if usage.HasOutputSeconds {
+		out["_actual_output_seconds"] = usage.OutputSeconds
+	}
+	if usage.HasInputImageCount {
+		out["_actual_input_image_count"] = usage.InputImageCount
+	}
+	if usage.VideoTokens > 0 {
+		out["_actual_video_tokens"] = usage.VideoTokens
+	}
+	return out
 }
 
 func upstreamUsageTokens(body []byte) (int, int) {
+	usage := upstreamUsageFromBody(body)
+	return usage.PromptTokens, usage.OutputTokens
+}
+
+func upstreamUsageFromBody(body []byte) upstreamUsageDetails {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return 0, 0
+		return upstreamUsageDetails{}
 	}
 	queue := []map[string]interface{}{raw}
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
 		if usage, ok := current["usage"].(map[string]interface{}); ok {
-			prompt := intAny(firstNonNil(usage["prompt_tokens"], usage["input_tokens"], usage["text_tokens"]))
-			output := intAny(firstNonNil(usage["completion_tokens"], usage["output_tokens"], usage["audio_tokens"]))
-			if prompt > 0 || output > 0 {
-				return prompt, output
+			details := upstreamUsageDetails{
+				PromptTokens: intAny(firstNonNil(usage["prompt_tokens"], usage["input_tokens"], usage["text_tokens"])),
+				OutputTokens: intAny(firstNonNil(usage["completion_tokens"], usage["output_tokens"], usage["audio_tokens"])),
+				VideoTokens:  intAny(firstNonNil(usage["total_tokens"], usage["video_tokens"])),
+			}
+			if details.VideoTokens <= 0 {
+				details.VideoTokens = details.OutputTokens
+			}
+			if details.OutputTokens <= 0 && details.VideoTokens > 0 {
+				details.OutputTokens = details.VideoTokens
+			}
+			if value, exists := usage["input_seconds"]; exists {
+				details.InputSeconds, details.HasInputSeconds = floatAny(value), true
+			}
+			if value, exists := usage["output_seconds"]; exists {
+				details.OutputSeconds, details.HasOutputSeconds = floatAny(value), true
+			}
+			if value, exists := usage["input_image_count"]; exists {
+				details.InputImageCount, details.HasInputImageCount = intAny(value), true
+			}
+			if !details.HasOutputSeconds {
+				if value, exists := usage["total_seconds"]; exists {
+					details.OutputSeconds = math.Max(0, floatAny(value)-details.InputSeconds)
+					details.HasOutputSeconds = true
+				}
+			}
+			if details.hasAny() {
+				return details
 			}
 		}
 		for _, key := range []string{"data", "result", "output", "task"} {
@@ -3340,7 +3410,7 @@ func upstreamUsageTokens(body []byte) (int, int) {
 			}
 		}
 	}
-	return 0, 0
+	return upstreamUsageDetails{}
 }
 
 func upstreamErrorMessage(body []byte) string {

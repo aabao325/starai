@@ -75,6 +75,72 @@ func TestValidateSeedance2InputCombinations(t *testing.T) {
 	}
 }
 
+func TestValidateMiniMaxH3InputCombinations(t *testing.T) {
+	standard := videoRuntimeConfig{
+		UploadProfile:      "minimax_h3",
+		MaxReferenceImages: 9,
+		MaxTotalImages:     9,
+		FirstFrameKey:      "first_frame",
+		LastFrameKey:       "last_frame",
+		ReferenceImagesKey: "reference_images",
+		ReferenceVideosKey: "reference_videos",
+		MaxReferenceVideos: 3,
+		ReferenceAudiosKey: "reference_audios",
+		MaxReferenceAudios: 3,
+		ModeParam:          "generation_mode",
+	}
+	tests := []struct {
+		name    string
+		params  map[string]interface{}
+		wantErr string
+	}{
+		{name: "text", params: map[string]interface{}{"generation_mode": "text", "prompt": "海边日落"}},
+		{name: "last frame", params: map[string]interface{}{"generation_mode": "last_frame", "prompt": "镜头靠近", "last_frame": "https://example.com/last.jpg"}},
+		{name: "multimodal", params: map[string]interface{}{
+			"generation_mode":                  "reference",
+			"prompt":                           "保持主体并跟随音乐运动",
+			"reference_images":                 []interface{}{"https://example.com/ref.jpg"},
+			"reference_videos":                 []interface{}{"https://example.com/ref.mp4"},
+			"reference_audios":                 []interface{}{"https://example.com/ref.mp3"},
+			"reference_video_duration_seconds": float64(12),
+		}},
+		{name: "prompt required", params: map[string]interface{}{"generation_mode": "text"}, wantErr: "提示词"},
+		{name: "first frame required", params: map[string]interface{}{"generation_mode": "first_frame", "prompt": "运动"}, wantErr: "1 张首帧"},
+		{name: "cannot mix frames", params: map[string]interface{}{
+			"generation_mode": "reference", "prompt": "运动",
+			"first_frame":      "https://example.com/first.jpg",
+			"reference_images": []interface{}{"https://example.com/ref.jpg"},
+		}, wantErr: "不能与首尾帧混用"},
+		{name: "input video duration limit", params: map[string]interface{}{
+			"generation_mode": "reference", "prompt": "运动",
+			"reference_videos":                 []interface{}{"https://example.com/ref.mp4"},
+			"reference_video_duration_seconds": float64(16),
+		}, wantErr: "0～15 秒"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateVideoUpload(standard, tt.params)
+			if tt.wantErr == "" && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	maxModel := standard
+	maxModel.MaxReferenceImages = 0
+	maxModel.MaxReferenceVideos = 0
+	maxModel.MaxReferenceAudios = 0
+	err := validateVideoUpload(maxModel, map[string]interface{}{
+		"generation_mode": "reference", "prompt": "运动",
+	})
+	if err == nil || !strings.Contains(err.Error(), "不支持多模态参考") {
+		t.Fatalf("H3-Max reference mode error = %v", err)
+	}
+}
+
 func TestValidateVideoParamsPreservesProviderDurationEnumType(t *testing.T) {
 	veo := &ModelFull{ModelDTO: ModelDTO{
 		InputSchema: map[string]interface{}{
